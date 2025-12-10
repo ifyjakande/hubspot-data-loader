@@ -1,0 +1,57 @@
+name: Sync HubSpot Data to Snowflake
+
+on:
+  # Run manually via workflow dispatch
+  workflow_dispatch:
+
+  # Run automatically after load-data workflow completes
+  workflow_run:
+    workflows: ["Load HubSpot Sample Data"]
+    types:
+      - completed
+
+  # Also run on schedule as backup (every 15 minutes)
+  schedule:
+    - cron: '*/15 * * * *'  # Every 15 minutes
+
+jobs:
+  sync-to-snowflake:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Sync HubSpot data to Snowflake
+      env:
+        HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+        SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+        SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+        SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+        SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+        SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA || 'PUBLIC' }}
+      run: |
+        python sync_to_snowflake.py
+
+    - name: Sync Summary
+      if: success()
+      run: |
+        echo "✅ Sync completed successfully!"
+        echo "Data has been synchronized from HubSpot to Snowflake."
+        echo "Check the logs above for reconciliation report."
+
+    - name: Sync Failed
+      if: failure()
+      run: |
+        echo "❌ Sync failed! Check the logs above for details."
+        exit 1

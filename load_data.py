@@ -6,6 +6,7 @@ HubSpot Data Loader - Generates and loads realistic sample data into HubSpot
 import os
 import random
 import requests
+import time
 from datetime import datetime, timedelta
 from faker import Faker
 
@@ -19,8 +20,12 @@ if not HUBSPOT_API_KEY:
 
 HUBSPOT_API_URL = 'https://api.hubapi.com'
 
+# Rate limiting configuration
+MAX_RETRIES = 5
+INITIAL_RETRY_DELAY = 2  # seconds
+
 def create_contact(email, first_name, last_name, phone=None, job_title=None, company_name=None):
-    """Create a contact in HubSpot"""
+    """Create a contact in HubSpot with rate limiting"""
     url = f'{HUBSPOT_API_URL}/crm/v3/objects/contacts'
     headers = {
         'Authorization': f'Bearer {HUBSPOT_API_KEY}',
@@ -42,21 +47,39 @@ def create_contact(email, first_name, last_name, phone=None, job_title=None, com
 
     payload = {'properties': properties}
 
-    try:
-        response = requests.post(url, json=payload, headers=headers)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.HTTPError as e:
-        if response.status_code == 409:
-            print(f"Contact {email} already exists, skipping...")
-            return None
-        else:
-            print(f"Error creating contact: {e}")
-            print(f"Response: {response.text}")
-            return None
+    retry_delay = INITIAL_RETRY_DELAY
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(url, json=payload, headers=headers)
+            
+            # Handle rate limiting
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', retry_delay))
+                print(f"⚠️  Rate limited. Waiting {retry_after} seconds...")
+                time.sleep(retry_after)
+                retry_delay *= 2
+                continue
+            
+            # Handle duplicate contacts
+            if response.status_code == 409:
+                print(f"Contact {email} already exists, skipping...")
+                return None
+            
+            response.raise_for_status()
+            return response.json()
+            
+        except requests.exceptions.HTTPError as e:
+            if attempt == MAX_RETRIES - 1:
+                print(f"Error creating contact after {MAX_RETRIES} attempts: {e}")
+                print(f"Response: {response.text}")
+                return None
+            time.sleep(retry_delay)
+            retry_delay *= 2
+    
+    return None
 
 def create_company(name, domain=None, industry=None, city=None, country=None):
-    """Create a company in HubSpot"""
+    """Create a company in HubSpot with rate limiting"""
     url = f'{HUBSPOT_API_URL}/crm/v3/objects/companies'
     headers = {
         'Authorization': f'Bearer {HUBSPOT_API_KEY}',
@@ -78,18 +101,36 @@ def create_company(name, domain=None, industry=None, city=None, country=None):
 
     payload = {'properties': properties}
 
-    try:
-        response = requests.post(url, json=payload, headers=headers)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.HTTPError as e:
-        if response.status_code == 409:
-            print(f"Company {name} already exists, skipping...")
-            return None
-        else:
-            print(f"Error creating company: {e}")
-            print(f"Response: {response.text}")
-            return None
+    retry_delay = INITIAL_RETRY_DELAY
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(url, json=payload, headers=headers)
+            
+            # Handle rate limiting
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', retry_delay))
+                print(f"⚠️  Rate limited. Waiting {retry_after} seconds...")
+                time.sleep(retry_after)
+                retry_delay *= 2
+                continue
+            
+            # Handle duplicate companies
+            if response.status_code == 409:
+                print(f"Company {name} already exists, skipping...")
+                return None
+            
+            response.raise_for_status()
+            return response.json()
+            
+        except requests.exceptions.HTTPError as e:
+            if attempt == MAX_RETRIES - 1:
+                print(f"Error creating company after {MAX_RETRIES} attempts: {e}")
+                print(f"Response: {response.text}")
+                return None
+            time.sleep(retry_delay)
+            retry_delay *= 2
+    
+    return None
 
 def generate_sample_data(num_contacts=10, num_companies=5):
     """Generate and load sample data into HubSpot"""
