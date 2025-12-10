@@ -165,57 +165,103 @@ def get_last_sync_timestamp(conn, object_type: str) -> Optional[str]:
         cursor.close()
 
 def fetch_hubspot_data(object_type: str, properties: List[str], modified_since: Optional[str] = None) -> List[Dict]:
-    """Fetch data from HubSpot API with pagination and rate limiting"""
-    url = f'{HUBSPOT_API_URL}/crm/v3/objects/{object_type}'
-    headers = {
-        'Authorization': f'Bearer {HUBSPOT_API_KEY}',
-        'Content-Type': 'application/json'
-    }
+    """Fetch data from HubSpot API with server-side filtering and rate limiting"""
     
     # Add lastmodifieddate to properties for incremental loading
     all_properties = properties + ['hs_lastmodifieddate']
     
-    params = {
-        'limit': 100,
-        'properties': ','.join(all_properties)
-    }
+    # Use Search API for incremental loading (server-side filtering)
+    if modified_since:
+        print(f"  Using incremental load: fetching records modified since {modified_since}")
+        url = f'{HUBSPOT_API_URL}/crm/v3/objects/{object_type}/search'
+        headers = {
+            'Authorization': f'Bearer {HUBSPOT_API_KEY}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Convert modified_since to milliseconds timestamp for HubSpot
+        from datetime import datetime as dt
+        modified_dt = dt.fromisoformat(modified_since.replace('Z', '+00:00') if 'Z' in modified_since else modified_since)
+        modified_ms = int(modified_dt.timestamp() * 1000)
+        
+        payload = {
+            'filterGroups': [{
+                'filters': [{
+                    'propertyName': 'hs_lastmodifieddate',
+                    'operator': 'GTE',  # Greater than or equal to
+                    'value': str(modified_ms)
+                }]
+            }],
+            'properties': all_properties,
+            'limit': 100
+        }
+        
+        all_records = []
+        after = 0
+        page_count = 0
+        
+        while True:
+            payload['after'] = after
+            
+            # Use rate-limited request function
+            data = make_hubspot_request(url, headers, payload, method='POST')
+            
+            results = data.get('results', [])
+            all_records.extend(results)
+            page_count += 1
+            
+            # Check if there are more results
+            if 'paging' in data and 'next' in data['paging']:
+                after = data['paging']['next'].get('after', 0)
+                time.sleep(0.1)
+            else:
+                break
+        
+        if page_count > 1:
+            print(f"  (Fetched {page_count} pages via Search API)")
+        
+        return all_records
     
-    all_records = []
-    after = None
-    page_count = 0
-    
-    while True:
-        if after:
-            params['after'] = after
+    else:
+        # Full sync - use standard objects API
+        print(f"  Using full load: fetching all records")
+        url = f'{HUBSPOT_API_URL}/crm/v3/objects/{object_type}'
+        headers = {
+            'Authorization': f'Bearer {HUBSPOT_API_KEY}',
+            'Content-Type': 'application/json'
+        }
         
-        # Use rate-limited request function
-        data = make_hubspot_request(url, headers, params, method='GET')
+        params = {
+            'limit': 100,
+            'properties': ','.join(all_properties)
+        }
         
-        results = data.get('results', [])
-        page_count += 1
+        all_records = []
+        after = None
+        page_count = 0
         
-        # Filter by modified_since if provided
-        if modified_since:
-            results = [
-                r for r in results 
-                if r['properties'].get('hs_lastmodifieddate') and 
-                   r['properties'].get('hs_lastmodifieddate') > modified_since
-            ]
+        while True:
+            if after:
+                params['after'] = after
+            
+            # Use rate-limited request function
+            data = make_hubspot_request(url, headers, params, method='GET')
+            
+            results = data.get('results', [])
+            all_records.extend(results)
+            page_count += 1
+            
+            paging = data.get('paging', {})
+            if 'next' in paging:
+                after = paging['next'].get('after')
+                time.sleep(0.1)
+            else:
+                break
         
-        all_records.extend(results)
+        if page_count > 1:
+            print(f"  (Fetched {page_count} pages)")
         
-        paging = data.get('paging', {})
-        if 'next' in paging:
-            after = paging['next'].get('after')
-            # Small delay between pages to avoid rate limits
-            time.sleep(0.1)
-        else:
-            break
-    
-    if page_count > 1:
-        print(f"  (Fetched {page_count} pages)")
-    
-    return all_records
+        return all_records
 
 def get_hubspot_total_count(object_type: str) -> int:
     """Get total count of records in HubSpot by paginating through all results with rate limiting"""
@@ -259,13 +305,23 @@ def sync_contacts(conn):
     try:
         # Get last sync timestamp
         last_sync = get_last_sync_timestamp(conn, 'contacts')
-        print(f"Last sync timestamp: {last_sync or 'Never (full sync)'}")
+        if last_sync:
+            print(f"Last sync timestamp: {last_sync}")
+            print(f"  (This will fetch contacts modified on or after this time)")
+        else:
+            print("Last sync timestamp: Never (performing full sync)")
         
         # Fetch contacts from HubSpot
         print("Fetching contacts from HubSpot...")
         properties = ['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'createdate']
         contacts = fetch_hubspot_data('contacts', properties, last_sync)
         print(f"✓ Fetched {len(contacts)} contacts to sync")
+        
+        if len(contacts) > 0 and last_sync:
+            # Show sample of what's being synced
+            sample_dates = [c['properties'].get('hs_lastmodifieddate') for c in contacts[:3] if c['properties'].get('hs_lastmodifieddate')]
+            if sample_dates:
+                print(f"  Sample modification dates: {', '.join(sample_dates[:3])}")
         
         if not contacts:
             print("No new or updated contacts to sync")
@@ -394,13 +450,23 @@ def sync_companies(conn):
     try:
         # Get last sync timestamp
         last_sync = get_last_sync_timestamp(conn, 'companies')
-        print(f"Last sync timestamp: {last_sync or 'Never (full sync)'}")
+        if last_sync:
+            print(f"Last sync timestamp: {last_sync}")
+            print(f"  (This will fetch companies modified on or after this time)")
+        else:
+            print("Last sync timestamp: Never (performing full sync)")
         
         # Fetch companies from HubSpot
         print("Fetching companies from HubSpot...")
         properties = ['name', 'domain', 'industry', 'city', 'country', 'createdate']
         companies = fetch_hubspot_data('companies', properties, last_sync)
         print(f"✓ Fetched {len(companies)} companies to sync")
+        
+        if len(companies) > 0 and last_sync:
+            # Show sample of what's being synced
+            sample_dates = [c['properties'].get('hs_lastmodifieddate') for c in companies[:3] if c['properties'].get('hs_lastmodifieddate')]
+            if sample_dates:
+                print(f"  Sample modification dates: {', '.join(sample_dates[:3])}")
         
         if not companies:
             print("No new or updated companies to sync")

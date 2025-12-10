@@ -5,7 +5,7 @@ Automatically populate your HubSpot account with realistic sample data and sync 
 ## Features
 
 - 🔄 **Incremental Loading**: Automatically adds new sample data to HubSpot
-- ❄️ **Snowflake Sync**: Syncs HubSpot data to Snowflake with incremental updates
+- ❄️ **Snowflake Sync**: Syncs HubSpot data to Snowflake with server-side incremental updates
 - ✅ **Data Validation**: Ensures source and destination have matching record counts
 - 🎯 **Realistic Data**: Uses Faker library to generate believable contacts and companies
 - ⚙️ **Configurable**: Control how many contacts/companies to create
@@ -185,8 +185,9 @@ Both `load_data.py` and `sync_to_snowflake.py` include robust rate limiting:
 ### Data Scale
 The pipeline can handle:
 - **Thousands of records**: Pagination handles large datasets efficiently
-- **Frequent Updates**: Incremental loading only syncs changed records
+- **Frequent Updates**: Incremental loading only syncs changed records using HubSpot's Search API
 - **Batch Processing**: Snowflake uses staging tables for optimal performance
+- **Server-side Filtering**: Uses HubSpot's Search API with `hs_lastmodifieddate >= last_sync_time` to fetch only changed records
 
 ## Notes
 
