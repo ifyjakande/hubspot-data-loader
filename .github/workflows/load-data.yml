@@ -1,0 +1,48 @@
+name: Load HubSpot Sample Data
+
+on:
+  # Run manually via workflow dispatch
+  workflow_dispatch:
+    inputs:
+      num_contacts:
+        description: 'Number of contacts to create'
+        required: true
+        default: '20'
+      num_companies:
+        description: 'Number of companies to create'
+        required: true
+        default: '10'
+
+  # Run automatically every 5 minutes (incremental loading)
+  schedule:
+    - cron: '*/5 * * * *'  # Every 5 minutes
+
+jobs:
+  load-data:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Load data into HubSpot
+      env:
+        HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+        NUM_CONTACTS: ${{ github.event.inputs.num_contacts || '20' }}
+        NUM_COMPANIES: ${{ github.event.inputs.num_companies || '10' }}
+      run: |
+        python load_data.py
+
+    - name: Summary
+      run: |
+        echo "Data load completed successfully!"
+        echo "Check your HubSpot account to see the new data."
