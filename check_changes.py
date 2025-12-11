@@ -37,7 +37,14 @@ def get_last_sync_timestamps() -> Dict[str, Optional[str]]:
         )
         
         cursor = conn.cursor()
-        cursor.execute("SELECT OBJECT_TYPE, LAST_SYNC_TIMESTAMP FROM SYNC_METADATA")
+        # Also retrieve Snowflake counts for active (non-deleted) records
+        cursor.execute("""
+            SELECT 
+                OBJECT_TYPE, 
+                LAST_SYNC_TIMESTAMP,
+                SNOWFLAKE_TOTAL_COUNT
+            FROM SYNC_METADATA
+        """)
         
         timestamps = {}
         for row in cursor.fetchall():

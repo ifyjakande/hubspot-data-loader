@@ -296,6 +296,42 @@ def get_hubspot_total_count(object_type: str) -> int:
     
     return total_count
 
+def get_all_hubspot_ids(object_type: str) -> set:
+    """Get all current HubSpot IDs for an object type (for soft delete detection)"""
+    url = f'{HUBSPOT_API_URL}/crm/v3/objects/{object_type}'
+    headers = {
+        'Authorization': f'Bearer {HUBSPOT_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+    
+    params = {
+        'limit': 100,
+        'properties': 'id'  # Only fetch IDs, minimal data transfer
+    }
+    
+    all_ids = set()
+    after = None
+    
+    while True:
+        if after:
+            params['after'] = after
+        
+        # Use rate-limited request function
+        data = make_hubspot_request(url, headers, params, method='GET')
+        
+        results = data.get('results', [])
+        for record in results:
+            all_ids.add(record['id'])
+        
+        paging = data.get('paging', {})
+        if 'next' in paging:
+            after = paging['next'].get('after')
+            time.sleep(0.1)  # Small delay between pages
+        else:
+            break
+    
+    return all_ids
+
 def sync_contacts(conn):
     """Sync contacts from HubSpot to Snowflake"""
     print("\n" + "=" * 70)
@@ -391,12 +427,39 @@ def sync_contacts(conn):
         else:
             print("No new or updated contacts to sync")
         
+        # Handle soft deletes: Mark records deleted in HubSpot
+        print("\nChecking for deleted contacts...")
+        current_hubspot_ids = get_all_hubspot_ids('contacts')
+        print(f"Current HubSpot IDs: {len(current_hubspot_ids)}")
+        
+        # Get all Snowflake IDs that are not already marked as deleted
+        cursor.execute("SELECT HUBSPOT_ID FROM CONTACTS WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
+        snowflake_ids = {row[0] for row in cursor.fetchall()}
+        print(f"Active Snowflake IDs: {len(snowflake_ids)}")
+        
+        # Find IDs in Snowflake but not in HubSpot (deleted records)
+        deleted_ids = snowflake_ids - current_hubspot_ids
+        
+        if deleted_ids:
+            print(f"Found {len(deleted_ids)} deleted contacts, marking as deleted...")
+            # Mark as deleted in batches
+            for hubspot_id in deleted_ids:
+                cursor.execute("""
+                    UPDATE CONTACTS 
+                    SET IS_DELETED = TRUE, DELETED_AT = CURRENT_TIMESTAMP()
+                    WHERE HUBSPOT_ID = %s
+                """, (hubspot_id,))
+            print(f"✓ Marked {len(deleted_ids)} contacts as deleted")
+        else:
+            print("✓ No deletions detected")
+        
         # Validate counts by comparing with actual HubSpot total
         print("\nValidating data...")
         print("Getting actual HubSpot total count...")
         hubspot_total = get_hubspot_total_count('contacts')
         
-        cursor.execute("SELECT COUNT(*) FROM CONTACTS")
+        # Count only active (non-deleted) records in Snowflake
+        cursor.execute("SELECT COUNT(*) FROM CONTACTS WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
         snowflake_total = cursor.fetchone()[0]
         
         counts_match = (hubspot_total == snowflake_total)
@@ -554,12 +617,39 @@ def sync_companies(conn):
         else:
             print("No new or updated companies to sync")
         
+        # Handle soft deletes: Mark records deleted in HubSpot
+        print("\nChecking for deleted companies...")
+        current_hubspot_ids = get_all_hubspot_ids('companies')
+        print(f"Current HubSpot IDs: {len(current_hubspot_ids)}")
+        
+        # Get all Snowflake IDs that are not already marked as deleted
+        cursor.execute("SELECT HUBSPOT_ID FROM COMPANIES WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
+        snowflake_ids = {row[0] for row in cursor.fetchall()}
+        print(f"Active Snowflake IDs: {len(snowflake_ids)}")
+        
+        # Find IDs in Snowflake but not in HubSpot (deleted records)
+        deleted_ids = snowflake_ids - current_hubspot_ids
+        
+        if deleted_ids:
+            print(f"Found {len(deleted_ids)} deleted companies, marking as deleted...")
+            # Mark as deleted in batches
+            for hubspot_id in deleted_ids:
+                cursor.execute("""
+                    UPDATE COMPANIES 
+                    SET IS_DELETED = TRUE, DELETED_AT = CURRENT_TIMESTAMP()
+                    WHERE HUBSPOT_ID = %s
+                """, (hubspot_id,))
+            print(f"✓ Marked {len(deleted_ids)} companies as deleted")
+        else:
+            print("✓ No deletions detected")
+        
         # Validate counts by comparing with actual HubSpot total
         print("\nValidating data...")
         print("Getting actual HubSpot total count...")
         hubspot_total = get_hubspot_total_count('companies')
         
-        cursor.execute("SELECT COUNT(*) FROM COMPANIES")
+        # Count only active (non-deleted) records in Snowflake
+        cursor.execute("SELECT COUNT(*) FROM COMPANIES WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
         snowflake_total = cursor.fetchone()[0]
         
         counts_match = (hubspot_total == snowflake_total)
