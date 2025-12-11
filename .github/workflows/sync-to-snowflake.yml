@@ -10,13 +10,69 @@ on:
     types:
       - completed
 
-  # Also run on schedule as backup (every 15 minutes)
+  # Run on schedule as backup (every hour) - cost optimized
   schedule:
-    - cron: '*/15 * * * *'  # Every 15 minutes
+    - cron: '0 * * * *'  # Every hour (reduced from 15 min for cost savings)
 
 jobs:
+  # Pre-check job: Lightweight check for changes (no Snowflake connection)
+  # Only runs for scheduled and manual triggers (not after workflow_run)
+  check-for-changes:
+    runs-on: ubuntu-latest
+    # Skip pre-check if triggered by workflow_run (data was just loaded, so changes exist)
+    if: github.event_name != 'workflow_run'
+    outputs:
+      has_changes: ${{ steps.check.outputs.has_changes }}
+      contacts_changed: ${{ steps.check.outputs.contacts_changed }}
+      companies_changed: ${{ steps.check.outputs.companies_changed }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Check for changes in HubSpot
+      id: check
+      env:
+        HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+        SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+        SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+        SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+        SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+        SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA || 'PUBLIC' }}
+      run: |
+        python check_changes.py
+
+    - name: Changes Summary
+      run: |
+        if [ "${{ steps.check.outputs.has_changes }}" == "true" ]; then
+          echo "✅ Changes detected:"
+          echo "   - Contacts: ${{ steps.check.outputs.contacts_changed }}"
+          echo "   - Companies: ${{ steps.check.outputs.companies_changed }}"
+          echo "   → Proceeding with sync"
+        else
+          echo "⏭️  No changes detected - Sync will be skipped"
+          echo "   💰 Snowflake compute cost saved!"
+        fi
+
+  # Sync job: Only runs if changes detected OR triggered by workflow_run
   sync-to-snowflake:
     runs-on: ubuntu-latest
+    needs: [check-for-changes]
+    # Run if: (1) workflow_run trigger, OR (2) changes detected from pre-check
+    if: |
+      always() && 
+      (github.event_name == 'workflow_run' || 
+       (needs.check-for-changes.result == 'success' && needs.check-for-changes.outputs.has_changes == 'true'))
 
     steps:
     - name: Checkout code
