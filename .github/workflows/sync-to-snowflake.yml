@@ -10,13 +10,9 @@ on:
     types:
       - completed
 
-  # Run on schedule as backup (every hour) - cost optimized
-  schedule:
-    - cron: '0 * * * *'  # Every hour (reduced from 15 min for cost savings)
-
 jobs:
   # Pre-check job: Lightweight check for changes (no Snowflake connection)
-  # Only runs for scheduled and manual triggers (not after workflow_run)
+  # Only runs for manual triggers (not after workflow_run)
   check-for-changes:
     runs-on: ubuntu-latest
     # Skip pre-check if triggered by workflow_run (data was just loaded, so changes exist)
