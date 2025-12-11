@@ -168,7 +168,9 @@ def fetch_hubspot_data(object_type: str, properties: List[str], modified_since: 
     """Fetch data from HubSpot API with server-side filtering and rate limiting"""
     
     # Add lastmodifieddate to properties for incremental loading
-    all_properties = properties + ['hs_lastmodifieddate']
+    # Note: contacts use 'lastmodifieddate', companies use 'hs_lastmodifieddate'
+    mod_date_property = 'lastmodifieddate' if object_type == 'contacts' else 'hs_lastmodifieddate'
+    all_properties = properties + [mod_date_property]
     
     # Use Search API for incremental loading (server-side filtering)
     if modified_since:
@@ -187,7 +189,7 @@ def fetch_hubspot_data(object_type: str, properties: List[str], modified_since: 
         payload = {
             'filterGroups': [{
                 'filters': [{
-                    'propertyName': 'hs_lastmodifieddate',
+                    'propertyName': mod_date_property,
                     'operator': 'GTE',  # Greater than or equal to
                     'value': str(modified_ms)
                 }]
@@ -318,114 +320,126 @@ def sync_contacts(conn):
         print(f"✓ Fetched {len(contacts)} contacts to sync")
         
         if len(contacts) > 0 and last_sync:
-            # Show sample of what's being synced
-            sample_dates = [c['properties'].get('hs_lastmodifieddate') for c in contacts[:3] if c['properties'].get('hs_lastmodifieddate')]
+            # Show sample of what's being synced (contacts use 'lastmodifieddate')
+            sample_dates = [c['properties'].get('lastmodifieddate') for c in contacts[:3] if c['properties'].get('lastmodifieddate')]
             if sample_dates:
                 print(f"  Sample modification dates: {', '.join(sample_dates[:3])}")
         
-        if not contacts:
-            print("No new or updated contacts to sync")
-            return
+        records_synced = len(contacts)
+        latest_modified = None
         
-        # Batch insert/update using temp table for better performance
-        print("Creating temporary staging table...")
-        cursor.execute("CREATE TEMPORARY TABLE CONTACTS_STAGE LIKE CONTACTS")
-        
-        # Insert all records into staging table
-        print("Inserting records into staging table...")
-        for contact in contacts:
-            props = contact['properties']
-            hubspot_id = contact['id']
+        # Only perform insert/merge if there are contacts to sync
+        if contacts:
+            # Batch insert/update using temp table for better performance
+            print("Creating temporary staging table...")
+            cursor.execute("CREATE TEMPORARY TABLE CONTACTS_STAGE LIKE CONTACTS")
             
+            # Insert all records into staging table
+            print("Inserting records into staging table...")
+            for contact in contacts:
+                props = contact['properties']
+                hubspot_id = contact['id']
+                
+                cursor.execute("""
+                    INSERT INTO CONTACTS_STAGE (
+                        HUBSPOT_ID, EMAIL, FIRSTNAME, LASTNAME, PHONE, JOBTITLE, COMPANY,
+                        HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
+                """, (
+                    hubspot_id,
+                    props.get('email'),
+                    props.get('firstname'),
+                    props.get('lastname'),
+                    props.get('phone'),
+                    props.get('jobtitle'),
+                    props.get('company'),
+                    props.get('createdate'),
+                    props.get('lastmodifieddate')  # contacts use 'lastmodifieddate'
+                ))
+            
+            # Perform bulk MERGE
+            print("Merging staged records into CONTACTS table...")
             cursor.execute("""
-                INSERT INTO CONTACTS_STAGE (
+                MERGE INTO CONTACTS AS target
+                USING CONTACTS_STAGE AS source
+                ON target.HUBSPOT_ID = source.HUBSPOT_ID
+                WHEN MATCHED THEN UPDATE SET
+                    EMAIL = source.EMAIL,
+                    FIRSTNAME = source.FIRSTNAME,
+                    LASTNAME = source.LASTNAME,
+                    PHONE = source.PHONE,
+                    JOBTITLE = source.JOBTITLE,
+                    COMPANY = source.COMPANY,
+                    HS_CREATEDATE = source.HS_CREATEDATE,
+                    HS_LASTMODIFIEDDATE = source.HS_LASTMODIFIEDDATE,
+                    SYNCED_AT = CURRENT_TIMESTAMP()
+                WHEN NOT MATCHED THEN INSERT (
                     HUBSPOT_ID, EMAIL, FIRSTNAME, LASTNAME, PHONE, JOBTITLE, COMPANY,
                     HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
-            """, (
-                hubspot_id,
-                props.get('email'),
-                props.get('firstname'),
-                props.get('lastname'),
-                props.get('phone'),
-                props.get('jobtitle'),
-                props.get('company'),
-                props.get('createdate'),
-                props.get('hs_lastmodifieddate')
-            ))
+                ) VALUES (
+                    source.HUBSPOT_ID, source.EMAIL, source.FIRSTNAME, source.LASTNAME,
+                    source.PHONE, source.JOBTITLE, source.COMPANY, source.HS_CREATEDATE,
+                    source.HS_LASTMODIFIEDDATE, CURRENT_TIMESTAMP()
+                )
+            """)
+            
+            print(f"✓ Merged {records_synced} records")
+            
+            # Get latest modified timestamp (filter out None values) - contacts use 'lastmodifieddate'
+            modified_dates = [c['properties'].get('lastmodifieddate') for c in contacts if c['properties'].get('lastmodifieddate')]
+            latest_modified = max(modified_dates) if modified_dates else None
+        else:
+            print("No new or updated contacts to sync")
         
-        # Perform bulk MERGE
-        print("Merging staged records into CONTACTS table...")
-        cursor.execute("""
-            MERGE INTO CONTACTS AS target
-            USING CONTACTS_STAGE AS source
-            ON target.HUBSPOT_ID = source.HUBSPOT_ID
-            WHEN MATCHED THEN UPDATE SET
-                EMAIL = source.EMAIL,
-                FIRSTNAME = source.FIRSTNAME,
-                LASTNAME = source.LASTNAME,
-                PHONE = source.PHONE,
-                JOBTITLE = source.JOBTITLE,
-                COMPANY = source.COMPANY,
-                HS_CREATEDATE = source.HS_CREATEDATE,
-                HS_LASTMODIFIEDDATE = source.HS_LASTMODIFIEDDATE,
-                SYNCED_AT = CURRENT_TIMESTAMP()
-            WHEN NOT MATCHED THEN INSERT (
-                HUBSPOT_ID, EMAIL, FIRSTNAME, LASTNAME, PHONE, JOBTITLE, COMPANY,
-                HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
-            ) VALUES (
-                source.HUBSPOT_ID, source.EMAIL, source.FIRSTNAME, source.LASTNAME,
-                source.PHONE, source.JOBTITLE, source.COMPANY, source.HS_CREATEDATE,
-                source.HS_LASTMODIFIEDDATE, CURRENT_TIMESTAMP()
-            )
-        """)
-        
-        records_synced = len(contacts)
-        print(f"✓ Merged {records_synced} records")
-        
-        # Get latest modified timestamp (filter out None values)
-        modified_dates = [c['properties'].get('hs_lastmodifieddate') for c in contacts if c['properties'].get('hs_lastmodifieddate')]
-        latest_modified = max(modified_dates) if modified_dates else datetime.now().isoformat()
-        
-        # Validate counts  
+        # Validate counts by comparing with actual HubSpot total
         print("\nValidating data...")
-        # Note: We validate Snowflake total against known synced count
-        # Full HubSpot count validation would require another full API pagination
+        print("Getting actual HubSpot total count...")
+        hubspot_total = get_hubspot_total_count('contacts')
+        
         cursor.execute("SELECT COUNT(*) FROM CONTACTS")
         snowflake_total = cursor.fetchone()[0]
         
-        # For validation, we compare if at least this batch was synced correctly
-        counts_match = snowflake_total >= records_synced
-        hubspot_total = snowflake_total  # Assume Snowflake is source of truth after sync
+        counts_match = (hubspot_total == snowflake_total)
         
-        # Update sync metadata
-        cursor.execute("""
-            MERGE INTO SYNC_METADATA AS target
-            USING (SELECT 
-                %s AS OBJECT_TYPE,
-                %s AS LAST_SYNC_TIMESTAMP,
-                %s AS RECORDS_SYNCED,
-                %s AS HUBSPOT_TOTAL_COUNT,
-                %s AS SNOWFLAKE_TOTAL_COUNT,
-                %s AS COUNTS_MATCH
-            ) AS source
-            ON target.OBJECT_TYPE = source.OBJECT_TYPE
-            WHEN MATCHED THEN UPDATE SET
-                LAST_SYNC_TIMESTAMP = source.LAST_SYNC_TIMESTAMP,
-                RECORDS_SYNCED = source.RECORDS_SYNCED,
-                HUBSPOT_TOTAL_COUNT = source.HUBSPOT_TOTAL_COUNT,
-                SNOWFLAKE_TOTAL_COUNT = source.SNOWFLAKE_TOTAL_COUNT,
-                COUNTS_MATCH = source.COUNTS_MATCH,
-                UPDATED_AT = CURRENT_TIMESTAMP()
-            WHEN NOT MATCHED THEN INSERT (
-                OBJECT_TYPE, LAST_SYNC_TIMESTAMP, RECORDS_SYNCED,
-                HUBSPOT_TOTAL_COUNT, SNOWFLAKE_TOTAL_COUNT, COUNTS_MATCH, UPDATED_AT
-            ) VALUES (
-                source.OBJECT_TYPE, source.LAST_SYNC_TIMESTAMP, source.RECORDS_SYNCED,
-                source.HUBSPOT_TOTAL_COUNT, source.SNOWFLAKE_TOTAL_COUNT,
-                source.COUNTS_MATCH, CURRENT_TIMESTAMP()
-            )
-        """, ('contacts', latest_modified, records_synced, hubspot_total, snowflake_total, counts_match))
+        # Update sync metadata (only update timestamp if we actually synced records)
+        if latest_modified:
+            cursor.execute("""
+                MERGE INTO SYNC_METADATA AS target
+                USING (SELECT 
+                    %s AS OBJECT_TYPE,
+                    %s AS LAST_SYNC_TIMESTAMP,
+                    %s AS RECORDS_SYNCED,
+                    %s AS HUBSPOT_TOTAL_COUNT,
+                    %s AS SNOWFLAKE_TOTAL_COUNT,
+                    %s AS COUNTS_MATCH
+                ) AS source
+                ON target.OBJECT_TYPE = source.OBJECT_TYPE
+                WHEN MATCHED THEN UPDATE SET
+                    LAST_SYNC_TIMESTAMP = source.LAST_SYNC_TIMESTAMP,
+                    RECORDS_SYNCED = source.RECORDS_SYNCED,
+                    HUBSPOT_TOTAL_COUNT = source.HUBSPOT_TOTAL_COUNT,
+                    SNOWFLAKE_TOTAL_COUNT = source.SNOWFLAKE_TOTAL_COUNT,
+                    COUNTS_MATCH = source.COUNTS_MATCH,
+                    UPDATED_AT = CURRENT_TIMESTAMP()
+                WHEN NOT MATCHED THEN INSERT (
+                    OBJECT_TYPE, LAST_SYNC_TIMESTAMP, RECORDS_SYNCED,
+                    HUBSPOT_TOTAL_COUNT, SNOWFLAKE_TOTAL_COUNT, COUNTS_MATCH, UPDATED_AT
+                ) VALUES (
+                    source.OBJECT_TYPE, source.LAST_SYNC_TIMESTAMP, source.RECORDS_SYNCED,
+                    source.HUBSPOT_TOTAL_COUNT, source.SNOWFLAKE_TOTAL_COUNT,
+                    source.COUNTS_MATCH, CURRENT_TIMESTAMP()
+                )
+            """, ('contacts', latest_modified, records_synced, hubspot_total, snowflake_total, counts_match))
+        else:
+            # No records synced, only update counts and match status
+            cursor.execute("""
+                UPDATE SYNC_METADATA
+                SET HUBSPOT_TOTAL_COUNT = %s,
+                    SNOWFLAKE_TOTAL_COUNT = %s,
+                    COUNTS_MATCH = %s,
+                    UPDATED_AT = CURRENT_TIMESTAMP()
+                WHERE OBJECT_TYPE = %s
+            """, (hubspot_total, snowflake_total, counts_match, 'contacts'))
         
         conn.commit()
         
@@ -434,7 +448,15 @@ def sync_contacts(conn):
         print(f"Records synced in this batch: {records_synced}")
         print(f"HubSpot total count: {hubspot_total}")
         print(f"Snowflake total count: {snowflake_total}")
-        print(f"Status: {'✅ COUNTS MATCH' if counts_match else '⚠️ COUNT MISMATCH'}")
+        print(f"Status: {'✅ COUNTS MATCH' if counts_match else '❌ COUNT MISMATCH'}")
+        
+        # Fail if counts don't match
+        if not counts_match:
+            raise ValueError(
+                f"Data validation failed: HubSpot has {hubspot_total} contacts "
+                f"but Snowflake has {snowflake_total} contacts. "
+                f"Difference: {hubspot_total - snowflake_total} records."
+            )
         
     finally:
         cursor.close()
@@ -468,107 +490,119 @@ def sync_companies(conn):
             if sample_dates:
                 print(f"  Sample modification dates: {', '.join(sample_dates[:3])}")
         
-        if not companies:
-            print("No new or updated companies to sync")
-            return
+        records_synced = len(companies)
+        latest_modified = None
         
-        # Batch insert/update using temp table for better performance
-        print("Creating temporary staging table...")
-        cursor.execute("CREATE TEMPORARY TABLE COMPANIES_STAGE LIKE COMPANIES")
-        
-        # Insert all records into staging table
-        print("Inserting records into staging table...")
-        for company in companies:
-            props = company['properties']
-            hubspot_id = company['id']
+        # Only perform insert/merge if there are companies to sync
+        if companies:
+            # Batch insert/update using temp table for better performance
+            print("Creating temporary staging table...")
+            cursor.execute("CREATE TEMPORARY TABLE COMPANIES_STAGE LIKE COMPANIES")
             
+            # Insert all records into staging table
+            print("Inserting records into staging table...")
+            for company in companies:
+                props = company['properties']
+                hubspot_id = company['id']
+                
+                cursor.execute("""
+                    INSERT INTO COMPANIES_STAGE (
+                        HUBSPOT_ID, NAME, DOMAIN, INDUSTRY, CITY, COUNTRY,
+                        HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
+                """, (
+                    hubspot_id,
+                    props.get('name'),
+                    props.get('domain'),
+                    props.get('industry'),
+                    props.get('city'),
+                    props.get('country'),
+                    props.get('createdate'),
+                    props.get('hs_lastmodifieddate')
+                ))
+            
+            # Perform bulk MERGE
+            print("Merging staged records into COMPANIES table...")
             cursor.execute("""
-                INSERT INTO COMPANIES_STAGE (
+                MERGE INTO COMPANIES AS target
+                USING COMPANIES_STAGE AS source
+                ON target.HUBSPOT_ID = source.HUBSPOT_ID
+                WHEN MATCHED THEN UPDATE SET
+                    NAME = source.NAME,
+                    DOMAIN = source.DOMAIN,
+                    INDUSTRY = source.INDUSTRY,
+                    CITY = source.CITY,
+                    COUNTRY = source.COUNTRY,
+                    HS_CREATEDATE = source.HS_CREATEDATE,
+                    HS_LASTMODIFIEDDATE = source.HS_LASTMODIFIEDDATE,
+                    SYNCED_AT = CURRENT_TIMESTAMP()
+                WHEN NOT MATCHED THEN INSERT (
                     HUBSPOT_ID, NAME, DOMAIN, INDUSTRY, CITY, COUNTRY,
                     HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
-            """, (
-                hubspot_id,
-                props.get('name'),
-                props.get('domain'),
-                props.get('industry'),
-                props.get('city'),
-                props.get('country'),
-                props.get('createdate'),
-                props.get('hs_lastmodifieddate')
-            ))
+                ) VALUES (
+                    source.HUBSPOT_ID, source.NAME, source.DOMAIN, source.INDUSTRY,
+                    source.CITY, source.COUNTRY, source.HS_CREATEDATE,
+                    source.HS_LASTMODIFIEDDATE, CURRENT_TIMESTAMP()
+                )
+            """)
+            
+            print(f"✓ Merged {records_synced} records")
+            
+            # Get latest modified timestamp (filter out None values)
+            modified_dates = [c['properties'].get('hs_lastmodifieddate') for c in companies if c['properties'].get('hs_lastmodifieddate')]
+            latest_modified = max(modified_dates) if modified_dates else None
+        else:
+            print("No new or updated companies to sync")
         
-        # Perform bulk MERGE
-        print("Merging staged records into COMPANIES table...")
-        cursor.execute("""
-            MERGE INTO COMPANIES AS target
-            USING COMPANIES_STAGE AS source
-            ON target.HUBSPOT_ID = source.HUBSPOT_ID
-            WHEN MATCHED THEN UPDATE SET
-                NAME = source.NAME,
-                DOMAIN = source.DOMAIN,
-                INDUSTRY = source.INDUSTRY,
-                CITY = source.CITY,
-                COUNTRY = source.COUNTRY,
-                HS_CREATEDATE = source.HS_CREATEDATE,
-                HS_LASTMODIFIEDDATE = source.HS_LASTMODIFIEDDATE,
-                SYNCED_AT = CURRENT_TIMESTAMP()
-            WHEN NOT MATCHED THEN INSERT (
-                HUBSPOT_ID, NAME, DOMAIN, INDUSTRY, CITY, COUNTRY,
-                HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
-            ) VALUES (
-                source.HUBSPOT_ID, source.NAME, source.DOMAIN, source.INDUSTRY,
-                source.CITY, source.COUNTRY, source.HS_CREATEDATE,
-                source.HS_LASTMODIFIEDDATE, CURRENT_TIMESTAMP()
-            )
-        """)
-        
-        records_synced = len(companies)
-        print(f"✓ Merged {records_synced} records")
-        
-        # Get latest modified timestamp (filter out None values)
-        modified_dates = [c['properties'].get('hs_lastmodifieddate') for c in companies if c['properties'].get('hs_lastmodifieddate')]
-        latest_modified = max(modified_dates) if modified_dates else datetime.now().isoformat()
-        
-        # Validate counts
+        # Validate counts by comparing with actual HubSpot total
         print("\nValidating data...")
-        # Note: We validate Snowflake total against known synced count
-        # Full HubSpot count validation would require another full API pagination
+        print("Getting actual HubSpot total count...")
+        hubspot_total = get_hubspot_total_count('companies')
+        
         cursor.execute("SELECT COUNT(*) FROM COMPANIES")
         snowflake_total = cursor.fetchone()[0]
         
-        # For validation, we compare if at least this batch was synced correctly
-        counts_match = snowflake_total >= records_synced
-        hubspot_total = snowflake_total  # Assume Snowflake is source of truth after sync
+        counts_match = (hubspot_total == snowflake_total)
         
-        # Update sync metadata
-        cursor.execute("""
-            MERGE INTO SYNC_METADATA AS target
-            USING (SELECT 
-                %s AS OBJECT_TYPE,
-                %s AS LAST_SYNC_TIMESTAMP,
-                %s AS RECORDS_SYNCED,
-                %s AS HUBSPOT_TOTAL_COUNT,
-                %s AS SNOWFLAKE_TOTAL_COUNT,
-                %s AS COUNTS_MATCH
-            ) AS source
-            ON target.OBJECT_TYPE = source.OBJECT_TYPE
-            WHEN MATCHED THEN UPDATE SET
-                LAST_SYNC_TIMESTAMP = source.LAST_SYNC_TIMESTAMP,
-                RECORDS_SYNCED = source.RECORDS_SYNCED,
-                HUBSPOT_TOTAL_COUNT = source.HUBSPOT_TOTAL_COUNT,
-                SNOWFLAKE_TOTAL_COUNT = source.SNOWFLAKE_TOTAL_COUNT,
-                COUNTS_MATCH = source.COUNTS_MATCH,
-                UPDATED_AT = CURRENT_TIMESTAMP()
-            WHEN NOT MATCHED THEN INSERT (
-                OBJECT_TYPE, LAST_SYNC_TIMESTAMP, RECORDS_SYNCED,
-                HUBSPOT_TOTAL_COUNT, SNOWFLAKE_TOTAL_COUNT, COUNTS_MATCH, UPDATED_AT
-            ) VALUES (
-                source.OBJECT_TYPE, source.LAST_SYNC_TIMESTAMP, source.RECORDS_SYNCED,
-                source.HUBSPOT_TOTAL_COUNT, source.SNOWFLAKE_TOTAL_COUNT,
-                source.COUNTS_MATCH, CURRENT_TIMESTAMP()
-            )
-        """, ('companies', latest_modified, records_synced, hubspot_total, snowflake_total, counts_match))
+        # Update sync metadata (only update timestamp if we actually synced records)
+        if latest_modified:
+            cursor.execute("""
+                MERGE INTO SYNC_METADATA AS target
+                USING (SELECT 
+                    %s AS OBJECT_TYPE,
+                    %s AS LAST_SYNC_TIMESTAMP,
+                    %s AS RECORDS_SYNCED,
+                    %s AS HUBSPOT_TOTAL_COUNT,
+                    %s AS SNOWFLAKE_TOTAL_COUNT,
+                    %s AS COUNTS_MATCH
+                ) AS source
+                ON target.OBJECT_TYPE = source.OBJECT_TYPE
+                WHEN MATCHED THEN UPDATE SET
+                    LAST_SYNC_TIMESTAMP = source.LAST_SYNC_TIMESTAMP,
+                    RECORDS_SYNCED = source.RECORDS_SYNCED,
+                    HUBSPOT_TOTAL_COUNT = source.HUBSPOT_TOTAL_COUNT,
+                    SNOWFLAKE_TOTAL_COUNT = source.SNOWFLAKE_TOTAL_COUNT,
+                    COUNTS_MATCH = source.COUNTS_MATCH,
+                    UPDATED_AT = CURRENT_TIMESTAMP()
+                WHEN NOT MATCHED THEN INSERT (
+                    OBJECT_TYPE, LAST_SYNC_TIMESTAMP, RECORDS_SYNCED,
+                    HUBSPOT_TOTAL_COUNT, SNOWFLAKE_TOTAL_COUNT, COUNTS_MATCH, UPDATED_AT
+                ) VALUES (
+                    source.OBJECT_TYPE, source.LAST_SYNC_TIMESTAMP, source.RECORDS_SYNCED,
+                    source.HUBSPOT_TOTAL_COUNT, source.SNOWFLAKE_TOTAL_COUNT,
+                    source.COUNTS_MATCH, CURRENT_TIMESTAMP()
+                )
+            """, ('companies', latest_modified, records_synced, hubspot_total, snowflake_total, counts_match))
+        else:
+            # No records synced, only update counts and match status
+            cursor.execute("""
+                UPDATE SYNC_METADATA
+                SET HUBSPOT_TOTAL_COUNT = %s,
+                    SNOWFLAKE_TOTAL_COUNT = %s,
+                    COUNTS_MATCH = %s,
+                    UPDATED_AT = CURRENT_TIMESTAMP()
+                WHERE OBJECT_TYPE = %s
+            """, (hubspot_total, snowflake_total, counts_match, 'companies'))
         
         conn.commit()
         
@@ -577,7 +611,15 @@ def sync_companies(conn):
         print(f"Records synced in this batch: {records_synced}")
         print(f"HubSpot total count: {hubspot_total}")
         print(f"Snowflake total count: {snowflake_total}")
-        print(f"Status: {'✅ COUNTS MATCH' if counts_match else '⚠️ COUNT MISMATCH'}")
+        print(f"Status: {'✅ COUNTS MATCH' if counts_match else '❌ COUNT MISMATCH'}")
+        
+        # Fail if counts don't match
+        if not counts_match:
+            raise ValueError(
+                f"Data validation failed: HubSpot has {hubspot_total} companies "
+                f"but Snowflake has {snowflake_total} companies. "
+                f"Difference: {hubspot_total - snowflake_total} records."
+            )
         
     finally:
         cursor.close()
