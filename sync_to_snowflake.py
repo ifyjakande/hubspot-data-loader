@@ -303,44 +303,97 @@ def get_all_hubspot_ids(object_type: str) -> set:
         'Authorization': f'Bearer {HUBSPOT_API_KEY}',
         'Content-Type': 'application/json'
     }
-    
+
     params = {
         'limit': 100,
         'properties': 'id'  # Only fetch IDs, minimal data transfer
     }
-    
+
     all_ids = set()
     after = None
-    
+
     while True:
         if after:
             params['after'] = after
-        
+
         # Use rate-limited request function
         data = make_hubspot_request(url, headers, params, method='GET')
-        
+
         results = data.get('results', [])
         for record in results:
             all_ids.add(record['id'])
-        
+
         paging = data.get('paging', {})
         if 'next' in paging:
             after = paging['next'].get('after')
             time.sleep(0.1)  # Small delay between pages
         else:
             break
-    
+
     return all_ids
 
+def fetch_records_by_ids(object_type: str, record_ids: List[str], properties: List[str]) -> List[Dict]:
+    """Fetch specific records from HubSpot by their IDs"""
+    if not record_ids:
+        return []
+
+    url = f'{HUBSPOT_API_URL}/crm/v3/objects/{object_type}/batch/read'
+    headers = {
+        'Authorization': f'Bearer {HUBSPOT_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+
+    # Determine modification date property
+    mod_date_property = 'lastmodifieddate' if object_type == 'contacts' else 'hs_lastmodifieddate'
+    all_properties = properties + [mod_date_property]
+
+    all_records = []
+
+    # HubSpot batch API accepts max 100 IDs per request
+    batch_size = 100
+    for i in range(0, len(record_ids), batch_size):
+        batch_ids = record_ids[i:i + batch_size]
+
+        payload = {
+            'inputs': [{'id': rid} for rid in batch_ids],
+            'properties': all_properties
+        }
+
+        try:
+            data = make_hubspot_request(url, headers, payload, method='POST')
+            results = data.get('results', [])
+            all_records.extend(results)
+            time.sleep(0.1)  # Rate limiting
+        except Exception as e:
+            print(f"  ⚠️  Warning: Failed to fetch batch starting at index {i}: {e}")
+            # Continue with other batches
+            continue
+
+    return all_records
+
 def sync_contacts(conn):
-    """Sync contacts from HubSpot to Snowflake"""
+    """
+    Sync contacts from HubSpot to Snowflake with self-healing reconciliation
+
+    Three-Phase Approach:
+    - Phase 1: Incremental Sync - Fetch records modified since last sync
+    - Phase 2: Reconciliation - Detect and sync any missing records (self-healing)
+    - Phase 3: Soft Delete - Mark records deleted in HubSpot
+
+    This ensures data consistency even if previous syncs were interrupted.
+    """
     print("\n" + "=" * 70)
-    print("SYNCING CONTACTS")
+    print("SYNCING CONTACTS (Multi-Phase Self-Healing)")
     print("=" * 70)
     
     cursor = conn.cursor()
-    
+
     try:
+        # PHASE 1: INCREMENTAL SYNC - Fetch modified records
+        print("\n" + "-" * 70)
+        print("PHASE 1: INCREMENTAL SYNC - Fetching modified records")
+        print("-" * 70)
+
         # Get last sync timestamp
         last_sync = get_last_sync_timestamp(conn, 'contacts')
         if last_sync:
@@ -348,7 +401,7 @@ def sync_contacts(conn):
             print(f"  (This will fetch contacts modified on or after this time)")
         else:
             print("Last sync timestamp: Never (performing full sync)")
-        
+
         # Fetch contacts from HubSpot
         print("Fetching contacts from HubSpot...")
         properties = ['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'createdate']
@@ -426,16 +479,101 @@ def sync_contacts(conn):
             latest_modified = max(modified_dates) if modified_dates else None
         else:
             print("No new or updated contacts to sync")
-        
-        # Handle soft deletes: Mark records deleted in HubSpot
-        print("\nChecking for deleted contacts...")
+
+        # PHASE 2: RECONCILIATION - Self-healing mechanism to catch missing records
+        print("\n" + "-" * 70)
+        print("PHASE 2: RECONCILIATION - Checking for missing records")
+        print("-" * 70)
+
+        # Get all HubSpot IDs
+        print("Fetching all contact IDs from HubSpot...")
         current_hubspot_ids = get_all_hubspot_ids('contacts')
-        print(f"Current HubSpot IDs: {len(current_hubspot_ids)}")
-        
-        # Get all Snowflake IDs that are not already marked as deleted
+        print(f"  HubSpot total: {len(current_hubspot_ids)} contacts")
+
+        # Get all active Snowflake IDs
         cursor.execute("SELECT HUBSPOT_ID FROM CONTACTS WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
         snowflake_ids = {row[0] for row in cursor.fetchall()}
-        print(f"Active Snowflake IDs: {len(snowflake_ids)}")
+        print(f"  Snowflake total: {len(snowflake_ids)} active contacts")
+
+        # Find missing IDs (exist in HubSpot but not in Snowflake)
+        missing_ids = current_hubspot_ids - snowflake_ids
+
+        if missing_ids:
+            print(f"\n  Found {len(missing_ids)} missing contacts in Snowflake!")
+            print(f"  These records exist in HubSpot but were never synced.")
+            print(f"  Fetching and syncing missing contacts...")
+
+            # Fetch full details for missing contacts
+            properties = ['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'createdate']
+            missing_contacts = fetch_records_by_ids('contacts', list(missing_ids), properties)
+            print(f"  Retrieved {len(missing_contacts)} missing contact records")
+
+            if missing_contacts:
+                # Create temp staging table for missing records
+                print("  Creating temporary staging table for missing records...")
+                cursor.execute("CREATE TEMPORARY TABLE CONTACTS_RECONCILE_STAGE LIKE CONTACTS")
+
+                # Insert missing records into staging
+                print("  Inserting missing records into staging table...")
+                for contact in missing_contacts:
+                    props = contact['properties']
+                    hubspot_id = contact['id']
+
+                    cursor.execute("""
+                        INSERT INTO CONTACTS_RECONCILE_STAGE (
+                            HUBSPOT_ID, EMAIL, FIRSTNAME, LASTNAME, PHONE, JOBTITLE, COMPANY,
+                            HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
+                    """, (
+                        hubspot_id,
+                        props.get('email'),
+                        props.get('firstname'),
+                        props.get('lastname'),
+                        props.get('phone'),
+                        props.get('jobtitle'),
+                        props.get('company'),
+                        props.get('createdate'),
+                        props.get('lastmodifieddate')
+                    ))
+
+                # Merge missing records into main table
+                print("  Merging missing records into CONTACTS table...")
+                cursor.execute("""
+                    MERGE INTO CONTACTS AS target
+                    USING CONTACTS_RECONCILE_STAGE AS source
+                    ON target.HUBSPOT_ID = source.HUBSPOT_ID
+                    WHEN NOT MATCHED THEN INSERT (
+                        HUBSPOT_ID, EMAIL, FIRSTNAME, LASTNAME, PHONE, JOBTITLE, COMPANY,
+                        HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
+                    ) VALUES (
+                        source.HUBSPOT_ID, source.EMAIL, source.FIRSTNAME, source.LASTNAME,
+                        source.PHONE, source.JOBTITLE, source.COMPANY, source.HS_CREATEDATE,
+                        source.HS_LASTMODIFIEDDATE, CURRENT_TIMESTAMP()
+                    )
+                """)
+
+                print(f"  Self-healing sync completed: {len(missing_contacts)} missing contacts recovered")
+                records_synced += len(missing_contacts)
+
+                # Update latest_modified if needed
+                missing_modified_dates = [c['properties'].get('lastmodifieddate') for c in missing_contacts if c['properties'].get('lastmodifieddate')]
+                if missing_modified_dates:
+                    missing_latest = max(missing_modified_dates)
+                    if not latest_modified or missing_latest > latest_modified:
+                        latest_modified = missing_latest
+        else:
+            print("  No missing records detected - Snowflake is in sync")
+
+        # PHASE 3: SOFT DELETE - Handle deletions
+        print("\n" + "-" * 70)
+        print("PHASE 3: SOFT DELETE - Checking for deleted contacts")
+        print("-" * 70)
+        # Reuse current_hubspot_ids and snowflake_ids from reconciliation phase
+        # But re-query Snowflake IDs in case reconciliation added records
+        cursor.execute("SELECT HUBSPOT_ID FROM CONTACTS WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
+        snowflake_ids = {row[0] for row in cursor.fetchall()}
+        print(f"  HubSpot IDs: {len(current_hubspot_ids)}")
+        print(f"  Active Snowflake IDs: {len(snowflake_ids)}")
         
         # Find IDs in Snowflake but not in HubSpot (deleted records)
         deleted_ids = snowflake_ids - current_hubspot_ids
@@ -525,14 +663,28 @@ def sync_contacts(conn):
         cursor.close()
 
 def sync_companies(conn):
-    """Sync companies from HubSpot to Snowflake"""
+    """
+    Sync companies from HubSpot to Snowflake with self-healing reconciliation
+
+    Three-Phase Approach:
+    - Phase 1: Incremental Sync - Fetch records modified since last sync
+    - Phase 2: Reconciliation - Detect and sync any missing records (self-healing)
+    - Phase 3: Soft Delete - Mark records deleted in HubSpot
+
+    This ensures data consistency even if previous syncs were interrupted.
+    """
     print("\n" + "=" * 70)
-    print("SYNCING COMPANIES")
+    print("SYNCING COMPANIES (Multi-Phase Self-Healing)")
     print("=" * 70)
-    
+
     cursor = conn.cursor()
-    
+
     try:
+        # PHASE 1: INCREMENTAL SYNC - Fetch modified records
+        print("\n" + "-" * 70)
+        print("PHASE 1: INCREMENTAL SYNC - Fetching modified records")
+        print("-" * 70)
+
         # Get last sync timestamp
         last_sync = get_last_sync_timestamp(conn, 'companies')
         if last_sync:
@@ -540,7 +692,7 @@ def sync_companies(conn):
             print(f"  (This will fetch companies modified on or after this time)")
         else:
             print("Last sync timestamp: Never (performing full sync)")
-        
+
         # Fetch companies from HubSpot
         print("Fetching companies from HubSpot...")
         properties = ['name', 'domain', 'industry', 'city', 'country', 'createdate']
@@ -616,16 +768,100 @@ def sync_companies(conn):
             latest_modified = max(modified_dates) if modified_dates else None
         else:
             print("No new or updated companies to sync")
-        
-        # Handle soft deletes: Mark records deleted in HubSpot
-        print("\nChecking for deleted companies...")
+
+        # PHASE 2: RECONCILIATION - Self-healing mechanism to catch missing records
+        print("\n" + "-" * 70)
+        print("PHASE 2: RECONCILIATION - Checking for missing records")
+        print("-" * 70)
+
+        # Get all HubSpot IDs
+        print("Fetching all company IDs from HubSpot...")
         current_hubspot_ids = get_all_hubspot_ids('companies')
-        print(f"Current HubSpot IDs: {len(current_hubspot_ids)}")
-        
-        # Get all Snowflake IDs that are not already marked as deleted
+        print(f"  HubSpot total: {len(current_hubspot_ids)} companies")
+
+        # Get all active Snowflake IDs
         cursor.execute("SELECT HUBSPOT_ID FROM COMPANIES WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
         snowflake_ids = {row[0] for row in cursor.fetchall()}
-        print(f"Active Snowflake IDs: {len(snowflake_ids)}")
+        print(f"  Snowflake total: {len(snowflake_ids)} active companies")
+
+        # Find missing IDs (exist in HubSpot but not in Snowflake)
+        missing_ids = current_hubspot_ids - snowflake_ids
+
+        if missing_ids:
+            print(f"\n  Found {len(missing_ids)} missing companies in Snowflake!")
+            print(f"  These records exist in HubSpot but were never synced.")
+            print(f"  Fetching and syncing missing companies...")
+
+            # Fetch full details for missing companies
+            properties = ['name', 'domain', 'industry', 'city', 'country', 'createdate']
+            missing_companies = fetch_records_by_ids('companies', list(missing_ids), properties)
+            print(f"  Retrieved {len(missing_companies)} missing company records")
+
+            if missing_companies:
+                # Create temp staging table for missing records
+                print("  Creating temporary staging table for missing records...")
+                cursor.execute("CREATE TEMPORARY TABLE COMPANIES_RECONCILE_STAGE LIKE COMPANIES")
+
+                # Insert missing records into staging
+                print("  Inserting missing records into staging table...")
+                for company in missing_companies:
+                    props = company['properties']
+                    hubspot_id = company['id']
+
+                    cursor.execute("""
+                        INSERT INTO COMPANIES_RECONCILE_STAGE (
+                            HUBSPOT_ID, NAME, DOMAIN, INDUSTRY, CITY, COUNTRY,
+                            HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
+                    """, (
+                        hubspot_id,
+                        props.get('name'),
+                        props.get('domain'),
+                        props.get('industry'),
+                        props.get('city'),
+                        props.get('country'),
+                        props.get('createdate'),
+                        props.get('hs_lastmodifieddate')
+                    ))
+
+                # Merge missing records into main table
+                print("  Merging missing records into COMPANIES table...")
+                cursor.execute("""
+                    MERGE INTO COMPANIES AS target
+                    USING COMPANIES_RECONCILE_STAGE AS source
+                    ON target.HUBSPOT_ID = source.HUBSPOT_ID
+                    WHEN NOT MATCHED THEN INSERT (
+                        HUBSPOT_ID, NAME, DOMAIN, INDUSTRY, CITY, COUNTRY,
+                        HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
+                    ) VALUES (
+                        source.HUBSPOT_ID, source.NAME, source.DOMAIN, source.INDUSTRY,
+                        source.CITY, source.COUNTRY, source.HS_CREATEDATE,
+                        source.HS_LASTMODIFIEDDATE, CURRENT_TIMESTAMP()
+                    )
+                """)
+
+                print(f"  Self-healing sync completed: {len(missing_companies)} missing companies recovered")
+                records_synced += len(missing_companies)
+
+                # Update latest_modified if needed
+                missing_modified_dates = [c['properties'].get('hs_lastmodifieddate') for c in missing_companies if c['properties'].get('hs_lastmodifieddate')]
+                if missing_modified_dates:
+                    missing_latest = max(missing_modified_dates)
+                    if not latest_modified or missing_latest > latest_modified:
+                        latest_modified = missing_latest
+        else:
+            print("  No missing records detected - Snowflake is in sync")
+
+        # PHASE 3: SOFT DELETE - Handle deletions
+        print("\n" + "-" * 70)
+        print("PHASE 3: SOFT DELETE - Checking for deleted companies")
+        print("-" * 70)
+        # Reuse current_hubspot_ids from reconciliation phase
+        # But re-query Snowflake IDs in case reconciliation added records
+        cursor.execute("SELECT HUBSPOT_ID FROM COMPANIES WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
+        snowflake_ids = {row[0] for row in cursor.fetchall()}
+        print(f"  HubSpot IDs: {len(current_hubspot_ids)}")
+        print(f"  Active Snowflake IDs: {len(snowflake_ids)}")
         
         # Find IDs in Snowflake but not in HubSpot (deleted records)
         deleted_ids = snowflake_ids - current_hubspot_ids
