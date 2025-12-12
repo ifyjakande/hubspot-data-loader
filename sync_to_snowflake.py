@@ -20,6 +20,12 @@ SNOWFLAKE_WAREHOUSE = os.environ.get('SNOWFLAKE_WAREHOUSE')
 SNOWFLAKE_DATABASE = os.environ.get('SNOWFLAKE_DATABASE', 'HUBSPOT_DATA')
 SNOWFLAKE_SCHEMA = os.environ.get('SNOWFLAKE_SCHEMA', 'PUBLIC')
 
+# Reconciliation optimization settings
+# Run full reconciliation every N syncs (set to 1 to run every time)
+RECONCILIATION_FREQUENCY = int(os.environ.get('RECONCILIATION_FREQUENCY', '10'))
+# Skip reconciliation if counts match (smart optimization)
+SKIP_RECONCILIATION_IF_COUNTS_MATCH = os.environ.get('SKIP_RECONCILIATION_IF_COUNTS_MATCH', 'true').lower() == 'true'
+
 # Validate required environment variables
 required_vars = {
     'HUBSPOT_API_KEY': HUBSPOT_API_KEY,
@@ -133,7 +139,7 @@ def initialize_snowflake_schema(conn):
             )
         """)
         
-        # Create SYNC_METADATA table
+        # Create SYNC_METADATA table with reconciliation tracking
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS SYNC_METADATA (
                 OBJECT_TYPE VARCHAR(50) PRIMARY KEY,
@@ -142,9 +148,25 @@ def initialize_snowflake_schema(conn):
                 HUBSPOT_TOTAL_COUNT INTEGER,
                 SNOWFLAKE_TOTAL_COUNT INTEGER,
                 COUNTS_MATCH BOOLEAN,
+                RECONCILIATION_RUN_COUNT INTEGER DEFAULT 0,
+                LAST_RECONCILIATION_AT TIMESTAMP_NTZ,
                 UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
             )
         """)
+
+        # Add reconciliation columns if they don't exist (for existing tables)
+        try:
+            cursor.execute("""
+                ALTER TABLE SYNC_METADATA
+                ADD COLUMN IF NOT EXISTS RECONCILIATION_RUN_COUNT INTEGER DEFAULT 0
+            """)
+            cursor.execute("""
+                ALTER TABLE SYNC_METADATA
+                ADD COLUMN IF NOT EXISTS LAST_RECONCILIATION_AT TIMESTAMP_NTZ
+            """)
+        except Exception as e:
+            # Columns might already exist, ignore error
+            pass
         
         print("✓ Snowflake schema initialized successfully")
         
@@ -161,6 +183,78 @@ def get_last_sync_timestamp(conn, object_type: str) -> Optional[str]:
         )
         result = cursor.fetchone()
         return result[0].isoformat() if result and result[0] else None
+    finally:
+        cursor.close()
+
+def should_run_reconciliation(conn, object_type: str) -> bool:
+    """
+    Determine if reconciliation should run for this sync
+
+    Reconciliation runs if:
+    1. It's never been run (first sync)
+    2. It's been N syncs since last reconciliation (based on RECONCILIATION_FREQUENCY)
+    3. Counts don't match (always run when there's a mismatch)
+    """
+    cursor = conn.cursor()
+    try:
+        # Get sync count and last reconciliation info
+        cursor.execute("""
+            SELECT
+                COALESCE(RECONCILIATION_RUN_COUNT, 0) as run_count,
+                COALESCE(LAST_RECONCILIATION_AT, '1970-01-01'::TIMESTAMP_NTZ) as last_recon,
+                HUBSPOT_TOTAL_COUNT,
+                SNOWFLAKE_TOTAL_COUNT
+            FROM SYNC_METADATA
+            WHERE OBJECT_TYPE = %s
+        """, (object_type,))
+        result = cursor.fetchone()
+
+        if not result:
+            # First sync ever - run reconciliation
+            return True
+
+        run_count, last_recon, hubspot_count, snowflake_count = result
+
+        # Always run if counts don't match
+        if hubspot_count != snowflake_count:
+            print(f"  Reconciliation triggered: Count mismatch detected ({hubspot_count} vs {snowflake_count})")
+            return True
+
+        # Run if we've reached the frequency threshold
+        if run_count >= RECONCILIATION_FREQUENCY:
+            print(f"  Reconciliation triggered: Periodic check (every {RECONCILIATION_FREQUENCY} syncs)")
+            return True
+
+        # Skip reconciliation
+        if SKIP_RECONCILIATION_IF_COUNTS_MATCH:
+            print(f"  Reconciliation skipped: Counts match ({hubspot_count}) - next full check in {RECONCILIATION_FREQUENCY - run_count} syncs")
+            return False
+        else:
+            return True
+
+    finally:
+        cursor.close()
+
+def update_reconciliation_metadata(conn, object_type: str, ran_reconciliation: bool):
+    """Update reconciliation tracking metadata"""
+    cursor = conn.cursor()
+    try:
+        if ran_reconciliation:
+            # Reset counter, update last reconciliation time
+            cursor.execute("""
+                UPDATE SYNC_METADATA
+                SET RECONCILIATION_RUN_COUNT = 0,
+                    LAST_RECONCILIATION_AT = CURRENT_TIMESTAMP()
+                WHERE OBJECT_TYPE = %s
+            """, (object_type,))
+        else:
+            # Increment counter
+            cursor.execute("""
+                UPDATE SYNC_METADATA
+                SET RECONCILIATION_RUN_COUNT = COALESCE(RECONCILIATION_RUN_COUNT, 0) + 1
+                WHERE OBJECT_TYPE = %s
+            """, (object_type,))
+        conn.commit()
     finally:
         cursor.close()
 
@@ -480,23 +574,33 @@ def sync_contacts(conn):
         else:
             print("No new or updated contacts to sync")
 
-        # PHASE 2: RECONCILIATION - Self-healing mechanism to catch missing records
+        # PHASE 2: RECONCILIATION - Smart self-healing mechanism
         print("\n" + "-" * 70)
-        print("PHASE 2: RECONCILIATION - Checking for missing records")
+        print("PHASE 2: RECONCILIATION - Smart self-healing check")
         print("-" * 70)
 
-        # Get all HubSpot IDs
-        print("Fetching all contact IDs from HubSpot...")
-        current_hubspot_ids = get_all_hubspot_ids('contacts')
-        print(f"  HubSpot total: {len(current_hubspot_ids)} contacts")
+        # Check if reconciliation should run (optimization for large datasets)
+        run_reconciliation = should_run_reconciliation(conn, 'contacts')
 
-        # Get all active Snowflake IDs
-        cursor.execute("SELECT HUBSPOT_ID FROM CONTACTS WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
-        snowflake_ids = {row[0] for row in cursor.fetchall()}
-        print(f"  Snowflake total: {len(snowflake_ids)} active contacts")
+        if run_reconciliation:
+            # Get all HubSpot IDs
+            print("Running full reconciliation...")
+            print("Fetching all contact IDs from HubSpot...")
+            current_hubspot_ids = get_all_hubspot_ids('contacts')
+            print(f"  HubSpot total: {len(current_hubspot_ids)} contacts")
 
-        # Find missing IDs (exist in HubSpot but not in Snowflake)
-        missing_ids = current_hubspot_ids - snowflake_ids
+            # Get all active Snowflake IDs
+            cursor.execute("SELECT HUBSPOT_ID FROM CONTACTS WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
+            snowflake_ids = {row[0] for row in cursor.fetchall()}
+            print(f"  Snowflake total: {len(snowflake_ids)} active contacts")
+
+            # Find missing IDs (exist in HubSpot but not in Snowflake)
+            missing_ids = current_hubspot_ids - snowflake_ids
+        else:
+            # Skip detailed reconciliation, just get IDs for soft delete phase
+            print("Using fast count validation (detailed reconciliation skipped)")
+            current_hubspot_ids = set()  # Will fetch for soft delete if needed
+            missing_ids = set()
 
         if missing_ids:
             print(f"\n  Found {len(missing_ids)} missing contacts in Snowflake!")
@@ -561,15 +665,22 @@ def sync_contacts(conn):
                     missing_latest = max(missing_modified_dates)
                     if not latest_modified or missing_latest > latest_modified:
                         latest_modified = missing_latest
-        else:
+        elif run_reconciliation:
             print("  No missing records detected - Snowflake is in sync")
+
+        # Update reconciliation metadata
+        update_reconciliation_metadata(conn, 'contacts', run_reconciliation)
 
         # PHASE 3: SOFT DELETE - Handle deletions
         print("\n" + "-" * 70)
         print("PHASE 3: SOFT DELETE - Checking for deleted contacts")
         print("-" * 70)
-        # Reuse current_hubspot_ids and snowflake_ids from reconciliation phase
-        # But re-query Snowflake IDs in case reconciliation added records
+
+        # Fetch IDs if not already done in reconciliation phase
+        if not current_hubspot_ids:
+            print("Fetching contact IDs for soft delete check...")
+            current_hubspot_ids = get_all_hubspot_ids('contacts')
+
         cursor.execute("SELECT HUBSPOT_ID FROM CONTACTS WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
         snowflake_ids = {row[0] for row in cursor.fetchall()}
         print(f"  HubSpot IDs: {len(current_hubspot_ids)}")
@@ -769,23 +880,33 @@ def sync_companies(conn):
         else:
             print("No new or updated companies to sync")
 
-        # PHASE 2: RECONCILIATION - Self-healing mechanism to catch missing records
+        # PHASE 2: RECONCILIATION - Smart self-healing mechanism
         print("\n" + "-" * 70)
-        print("PHASE 2: RECONCILIATION - Checking for missing records")
+        print("PHASE 2: RECONCILIATION - Smart self-healing check")
         print("-" * 70)
 
-        # Get all HubSpot IDs
-        print("Fetching all company IDs from HubSpot...")
-        current_hubspot_ids = get_all_hubspot_ids('companies')
-        print(f"  HubSpot total: {len(current_hubspot_ids)} companies")
+        # Check if reconciliation should run (optimization for large datasets)
+        run_reconciliation = should_run_reconciliation(conn, 'companies')
 
-        # Get all active Snowflake IDs
-        cursor.execute("SELECT HUBSPOT_ID FROM COMPANIES WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
-        snowflake_ids = {row[0] for row in cursor.fetchall()}
-        print(f"  Snowflake total: {len(snowflake_ids)} active companies")
+        if run_reconciliation:
+            # Get all HubSpot IDs
+            print("Running full reconciliation...")
+            print("Fetching all company IDs from HubSpot...")
+            current_hubspot_ids = get_all_hubspot_ids('companies')
+            print(f"  HubSpot total: {len(current_hubspot_ids)} companies")
 
-        # Find missing IDs (exist in HubSpot but not in Snowflake)
-        missing_ids = current_hubspot_ids - snowflake_ids
+            # Get all active Snowflake IDs
+            cursor.execute("SELECT HUBSPOT_ID FROM COMPANIES WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
+            snowflake_ids = {row[0] for row in cursor.fetchall()}
+            print(f"  Snowflake total: {len(snowflake_ids)} active companies")
+
+            # Find missing IDs (exist in HubSpot but not in Snowflake)
+            missing_ids = current_hubspot_ids - snowflake_ids
+        else:
+            # Skip detailed reconciliation, just get IDs for soft delete phase
+            print("Using fast count validation (detailed reconciliation skipped)")
+            current_hubspot_ids = set()  # Will fetch for soft delete if needed
+            missing_ids = set()
 
         if missing_ids:
             print(f"\n  Found {len(missing_ids)} missing companies in Snowflake!")
@@ -849,15 +970,22 @@ def sync_companies(conn):
                     missing_latest = max(missing_modified_dates)
                     if not latest_modified or missing_latest > latest_modified:
                         latest_modified = missing_latest
-        else:
+        elif run_reconciliation:
             print("  No missing records detected - Snowflake is in sync")
+
+        # Update reconciliation metadata
+        update_reconciliation_metadata(conn, 'companies', run_reconciliation)
 
         # PHASE 3: SOFT DELETE - Handle deletions
         print("\n" + "-" * 70)
         print("PHASE 3: SOFT DELETE - Checking for deleted companies")
         print("-" * 70)
-        # Reuse current_hubspot_ids from reconciliation phase
-        # But re-query Snowflake IDs in case reconciliation added records
+
+        # Fetch IDs if not already done in reconciliation phase
+        if not current_hubspot_ids:
+            print("Fetching company IDs for soft delete check...")
+            current_hubspot_ids = get_all_hubspot_ids('companies')
+
         cursor.execute("SELECT HUBSPOT_ID FROM COMPANIES WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
         snowflake_ids = {row[0] for row in cursor.fetchall()}
         print(f"  HubSpot IDs: {len(current_hubspot_ids)}")
