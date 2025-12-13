@@ -46,16 +46,22 @@ MAX_RETRIES = 5
 INITIAL_RETRY_DELAY = 2  # seconds
 MAX_RETRY_DELAY = 60  # seconds
 
-def make_hubspot_request(url: str, headers: dict, params: dict, method: str = 'GET') -> dict:
+def make_hubspot_request(
+    url: str,
+    headers: dict,
+    params: dict,
+    method: str = 'GET',
+    timeout_seconds: int = 30,
+) -> dict:
     """Make HubSpot API request with exponential backoff retry logic"""
     retry_delay = INITIAL_RETRY_DELAY
     
     for attempt in range(MAX_RETRIES):
         try:
             if method == 'GET':
-                response = requests.get(url, headers=headers, params=params)
+                response = requests.get(url, headers=headers, params=params, timeout=timeout_seconds)
             elif method == 'POST':
-                response = requests.post(url, headers=headers, json=params)
+                response = requests.post(url, headers=headers, json=params, timeout=timeout_seconds)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
             
@@ -312,11 +318,14 @@ def fetch_hubspot_data(object_type: str, properties: List[str], modified_since: 
         }
         
         all_records = []
-        after = 0
+        after = None
         page_count = 0
 
         while True:
-            payload['after'] = after
+            if after is not None:
+                payload['after'] = str(after)
+            else:
+                payload.pop('after', None)
 
             # Use rate-limited request function
             data = make_hubspot_request(url, headers, payload, method='POST')

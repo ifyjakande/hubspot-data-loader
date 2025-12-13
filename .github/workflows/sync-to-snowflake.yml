@@ -67,6 +67,7 @@ jobs:
   # Sync job: Only runs if changes detected OR triggered by workflow_run
   sync-to-snowflake:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     needs: [check-for-changes]
     # Run if: (1) workflow_run trigger, OR (2) changes detected from pre-check
     if: |
@@ -99,7 +100,7 @@ jobs:
         SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
         SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA || 'PUBLIC' }}
       run: |
-        python sync_to_snowflake.py
+        python -u sync_to_snowflake.py
 
     - name: Sync Summary
       if: success()
