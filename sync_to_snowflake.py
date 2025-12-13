@@ -228,9 +228,46 @@ def get_last_sync_timestamp(conn, object_type: str) -> Optional[str]:
             (object_type,)
         )
         result = cursor.fetchone()
-        return result[0].isoformat() if result and result[0] else None
+        if not result or not result[0]:
+            return None
+
+        # SYNC_METADATA stores TIMESTAMP_NTZ, so the returned datetime is timezone-naive.
+        # We treat these timestamps as UTC throughout the sync for consistency.
+        ts: datetime = result[0]
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.isoformat().replace('+00:00', 'Z')
     finally:
         cursor.close()
+
+
+def parse_hubspot_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+
+    v = str(value)
+    # HubSpot sometimes returns milliseconds timestamps (string). Handle that as UTC.
+    if v.isdigit():
+        return datetime.fromtimestamp(int(v) / 1000.0, tz=timezone.utc)
+
+    # Most CRM timestamps are ISO-8601 with a 'Z' suffix.
+    try:
+        dt = datetime.fromisoformat(v.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def as_utc_ntz(dt: Optional[datetime]) -> Optional[datetime]:
+    """Convert a datetime to a timezone-naive UTC datetime for TIMESTAMP_NTZ storage."""
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 def should_run_reconciliation(conn, object_type: str) -> bool:
     """
@@ -620,7 +657,7 @@ def sync_contacts(conn):
                 print(f"  Sample modification dates: {', '.join(sample_dates[:3])}")
         
         records_synced = len(contacts)
-        latest_modified = None
+        latest_modified_dt: Optional[datetime] = None
         
         # Only perform insert/merge if there are contacts to sync
         if contacts:
@@ -688,9 +725,11 @@ def sync_contacts(conn):
             
             print(f"✓ Merged {records_synced} records")
             
-            # Get latest modified timestamp (filter out None values) - contacts use 'lastmodifieddate'
-            modified_dates = [c['properties'].get('lastmodifieddate') for c in contacts if c['properties'].get('lastmodifieddate')]
-            latest_modified = max(modified_dates) if modified_dates else None
+            # Get latest modified timestamp (UTC) - contacts use 'lastmodifieddate'
+            for c in contacts:
+                dt = parse_hubspot_datetime(c['properties'].get('lastmodifieddate'))
+                if dt and (latest_modified_dt is None or dt > latest_modified_dt):
+                    latest_modified_dt = dt
         else:
             print("No new or updated contacts to sync")
 
@@ -791,9 +830,10 @@ def sync_contacts(conn):
                 # Update latest_modified if needed
                 missing_modified_dates = [c['properties'].get('lastmodifieddate') for c in missing_contacts if c['properties'].get('lastmodifieddate')]
                 if missing_modified_dates:
-                    missing_latest = max(missing_modified_dates)
-                    if not latest_modified or missing_latest > latest_modified:
-                        latest_modified = missing_latest
+                    for v in missing_modified_dates:
+                        dt = parse_hubspot_datetime(v)
+                        if dt and (latest_modified_dt is None or dt > latest_modified_dt):
+                            latest_modified_dt = dt
         elif run_reconciliation:
             print("  No missing records detected - Snowflake is in sync")
 
@@ -817,12 +857,25 @@ def sync_contacts(conn):
             deleted_ids = snowflake_ids - current_hubspot_ids
             if deleted_ids:
                 print(f"Found {len(deleted_ids)} deleted contacts, marking as deleted...")
+                cursor.execute("CREATE TEMPORARY TABLE DELETED_CONTACTS_STAGE (HUBSPOT_ID VARCHAR(50))")
+                insert_sql = "INSERT INTO DELETED_CONTACTS_STAGE (HUBSPOT_ID) VALUES (%s)"
+                batch_size = 5000
+                batch_params = []
                 for hubspot_id in deleted_ids:
-                    cursor.execute("""
-                        UPDATE CONTACTS
-                        SET IS_DELETED = TRUE, DELETED_AT = CURRENT_TIMESTAMP()
-                        WHERE HUBSPOT_ID = %s
-                    """, (hubspot_id,))
+                    batch_params.append((hubspot_id,))
+                    if len(batch_params) >= batch_size:
+                        cursor.executemany(insert_sql, batch_params)
+                        batch_params.clear()
+                if batch_params:
+                    cursor.executemany(insert_sql, batch_params)
+
+                cursor.execute("""
+                    UPDATE CONTACTS AS t
+                    SET IS_DELETED = TRUE,
+                        DELETED_AT = CURRENT_TIMESTAMP()
+                    FROM DELETED_CONTACTS_STAGE AS s
+                    WHERE t.HUBSPOT_ID = s.HUBSPOT_ID
+                """)
                 print(f"✓ Marked {len(deleted_ids)} contacts as deleted")
             else:
                 print("✓ No deletions detected")
@@ -844,6 +897,7 @@ def sync_contacts(conn):
             counts_match = None
         
         # Update sync metadata
+        latest_modified = as_utc_ntz(latest_modified_dt)
         if perform_full_validation and latest_modified:
             cursor.execute("""
                 MERGE INTO SYNC_METADATA AS target
@@ -984,7 +1038,7 @@ def sync_companies(conn):
                 print(f"  Sample modification dates: {', '.join(sample_dates[:3])}")
         
         records_synced = len(companies)
-        latest_modified = None
+        latest_modified_dt: Optional[datetime] = None
         
         # Only perform insert/merge if there are companies to sync
         if companies:
@@ -1050,9 +1104,11 @@ def sync_companies(conn):
             
             print(f"✓ Merged {records_synced} records")
             
-            # Get latest modified timestamp (filter out None values)
-            modified_dates = [c['properties'].get('hs_lastmodifieddate') for c in companies if c['properties'].get('hs_lastmodifieddate')]
-            latest_modified = max(modified_dates) if modified_dates else None
+            # Get latest modified timestamp (UTC)
+            for c in companies:
+                dt = parse_hubspot_datetime(c['properties'].get('hs_lastmodifieddate'))
+                if dt and (latest_modified_dt is None or dt > latest_modified_dt):
+                    latest_modified_dt = dt
         else:
             print("No new or updated companies to sync")
 
@@ -1152,9 +1208,10 @@ def sync_companies(conn):
                 # Update latest_modified if needed
                 missing_modified_dates = [c['properties'].get('hs_lastmodifieddate') for c in missing_companies if c['properties'].get('hs_lastmodifieddate')]
                 if missing_modified_dates:
-                    missing_latest = max(missing_modified_dates)
-                    if not latest_modified or missing_latest > latest_modified:
-                        latest_modified = missing_latest
+                    for v in missing_modified_dates:
+                        dt = parse_hubspot_datetime(v)
+                        if dt and (latest_modified_dt is None or dt > latest_modified_dt):
+                            latest_modified_dt = dt
         elif run_reconciliation:
             print("  No missing records detected - Snowflake is in sync")
 
@@ -1178,12 +1235,25 @@ def sync_companies(conn):
             deleted_ids = snowflake_ids - current_hubspot_ids
             if deleted_ids:
                 print(f"Found {len(deleted_ids)} deleted companies, marking as deleted...")
+                cursor.execute("CREATE TEMPORARY TABLE DELETED_COMPANIES_STAGE (HUBSPOT_ID VARCHAR(50))")
+                insert_sql = "INSERT INTO DELETED_COMPANIES_STAGE (HUBSPOT_ID) VALUES (%s)"
+                batch_size = 5000
+                batch_params = []
                 for hubspot_id in deleted_ids:
-                    cursor.execute("""
-                        UPDATE COMPANIES
-                        SET IS_DELETED = TRUE, DELETED_AT = CURRENT_TIMESTAMP()
-                        WHERE HUBSPOT_ID = %s
-                    """, (hubspot_id,))
+                    batch_params.append((hubspot_id,))
+                    if len(batch_params) >= batch_size:
+                        cursor.executemany(insert_sql, batch_params)
+                        batch_params.clear()
+                if batch_params:
+                    cursor.executemany(insert_sql, batch_params)
+
+                cursor.execute("""
+                    UPDATE COMPANIES AS t
+                    SET IS_DELETED = TRUE,
+                        DELETED_AT = CURRENT_TIMESTAMP()
+                    FROM DELETED_COMPANIES_STAGE AS s
+                    WHERE t.HUBSPOT_ID = s.HUBSPOT_ID
+                """)
                 print(f"✓ Marked {len(deleted_ids)} companies as deleted")
             else:
                 print("✓ No deletions detected")
@@ -1205,6 +1275,7 @@ def sync_companies(conn):
             counts_match = None
         
         # Update sync metadata
+        latest_modified = as_utc_ntz(latest_modified_dt)
         if perform_full_validation and latest_modified:
             cursor.execute("""
                 MERGE INTO SYNC_METADATA AS target
