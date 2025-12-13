@@ -13,9 +13,9 @@ on:
         required: true
         default: '2000'
 
-  # Run automatically every 5 minutes (incremental loading)
+  # Run automatically every 30 minutes (production-scale loading)
   schedule:
-    - cron: '*/5 * * * *'  # Every 5 minutes
+    - cron: '*/30 * * * *'  # Every 30 minutes
 
 jobs:
   load-data:
