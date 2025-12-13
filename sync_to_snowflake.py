@@ -555,16 +555,18 @@ def sync_contacts(conn):
             
             # Insert all records into staging table
             print("Inserting records into staging table...")
+            insert_sql = """
+                INSERT INTO CONTACTS_STAGE (
+                    HUBSPOT_ID, EMAIL, FIRSTNAME, LASTNAME, PHONE, JOBTITLE, COMPANY,
+                    HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
+            """
+            batch_size = 5000
+            batch_params = []
             for contact in contacts:
                 props = contact['properties']
                 hubspot_id = contact['id']
-                
-                cursor.execute("""
-                    INSERT INTO CONTACTS_STAGE (
-                        HUBSPOT_ID, EMAIL, FIRSTNAME, LASTNAME, PHONE, JOBTITLE, COMPANY,
-                        HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
-                """, (
+                batch_params.append((
                     hubspot_id,
                     props.get('email'),
                     props.get('firstname'),
@@ -575,6 +577,13 @@ def sync_contacts(conn):
                     props.get('createdate'),
                     props.get('lastmodifieddate')  # contacts use 'lastmodifieddate'
                 ))
+
+                if len(batch_params) >= batch_size:
+                    cursor.executemany(insert_sql, batch_params)
+                    batch_params.clear()
+
+            if batch_params:
+                cursor.executemany(insert_sql, batch_params)
             
             # Perform bulk MERGE
             print("Merging staged records into CONTACTS table...")
@@ -655,16 +664,18 @@ def sync_contacts(conn):
 
                 # Insert missing records into staging
                 print("  Inserting missing records into staging table...")
+                insert_sql = """
+                    INSERT INTO CONTACTS_RECONCILE_STAGE (
+                        HUBSPOT_ID, EMAIL, FIRSTNAME, LASTNAME, PHONE, JOBTITLE, COMPANY,
+                        HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
+                """
+                batch_size = 5000
+                batch_params = []
                 for contact in missing_contacts:
                     props = contact['properties']
                     hubspot_id = contact['id']
-
-                    cursor.execute("""
-                        INSERT INTO CONTACTS_RECONCILE_STAGE (
-                            HUBSPOT_ID, EMAIL, FIRSTNAME, LASTNAME, PHONE, JOBTITLE, COMPANY,
-                            HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
-                    """, (
+                    batch_params.append((
                         hubspot_id,
                         props.get('email'),
                         props.get('firstname'),
@@ -675,6 +686,13 @@ def sync_contacts(conn):
                         props.get('createdate'),
                         props.get('lastmodifieddate')
                     ))
+
+                    if len(batch_params) >= batch_size:
+                        cursor.executemany(insert_sql, batch_params)
+                        batch_params.clear()
+
+                if batch_params:
+                    cursor.executemany(insert_sql, batch_params)
 
                 # Merge missing records into main table
                 print("  Merging missing records into CONTACTS table...")
@@ -863,16 +881,18 @@ def sync_companies(conn):
             
             # Insert all records into staging table
             print("Inserting records into staging table...")
+            insert_sql = """
+                INSERT INTO COMPANIES_STAGE (
+                    HUBSPOT_ID, NAME, DOMAIN, INDUSTRY, CITY, COUNTRY,
+                    HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
+            """
+            batch_size = 5000
+            batch_params = []
             for company in companies:
                 props = company['properties']
                 hubspot_id = company['id']
-                
-                cursor.execute("""
-                    INSERT INTO COMPANIES_STAGE (
-                        HUBSPOT_ID, NAME, DOMAIN, INDUSTRY, CITY, COUNTRY,
-                        HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
-                """, (
+                batch_params.append((
                     hubspot_id,
                     props.get('name'),
                     props.get('domain'),
@@ -882,6 +902,13 @@ def sync_companies(conn):
                     props.get('createdate'),
                     props.get('hs_lastmodifieddate')
                 ))
+
+                if len(batch_params) >= batch_size:
+                    cursor.executemany(insert_sql, batch_params)
+                    batch_params.clear()
+
+            if batch_params:
+                cursor.executemany(insert_sql, batch_params)
             
             # Perform bulk MERGE
             print("Merging staged records into COMPANIES table...")
@@ -961,16 +988,18 @@ def sync_companies(conn):
 
                 # Insert missing records into staging
                 print("  Inserting missing records into staging table...")
+                insert_sql = """
+                    INSERT INTO COMPANIES_RECONCILE_STAGE (
+                        HUBSPOT_ID, NAME, DOMAIN, INDUSTRY, CITY, COUNTRY,
+                        HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
+                """
+                batch_size = 5000
+                batch_params = []
                 for company in missing_companies:
                     props = company['properties']
                     hubspot_id = company['id']
-
-                    cursor.execute("""
-                        INSERT INTO COMPANIES_RECONCILE_STAGE (
-                            HUBSPOT_ID, NAME, DOMAIN, INDUSTRY, CITY, COUNTRY,
-                            HS_CREATEDATE, HS_LASTMODIFIEDDATE, SYNCED_AT
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP())
-                    """, (
+                    batch_params.append((
                         hubspot_id,
                         props.get('name'),
                         props.get('domain'),
@@ -980,6 +1009,13 @@ def sync_companies(conn):
                         props.get('createdate'),
                         props.get('hs_lastmodifieddate')
                     ))
+
+                    if len(batch_params) >= batch_size:
+                        cursor.executemany(insert_sql, batch_params)
+                        batch_params.clear()
+
+                if batch_params:
+                    cursor.executemany(insert_sql, batch_params)
 
                 # Merge missing records into main table
                 print("  Merging missing records into COMPANIES table...")
