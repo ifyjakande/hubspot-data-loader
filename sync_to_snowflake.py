@@ -73,12 +73,31 @@ def make_hubspot_request(url: str, headers: dict, params: dict, method: str = 'G
                 retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
                 continue
             
+            # Handle 400 errors (bad request) - don't retry, log details and fail
+            if response.status_code == 400:
+                error_detail = "No error details"
+                try:
+                    error_detail = response.json()
+                except:
+                    error_detail = response.text
+                print(f"❌ Bad Request (400) - HubSpot API Error:")
+                print(f"   URL: {url}")
+                print(f"   Error details: {error_detail}")
+                raise requests.exceptions.HTTPError(f"400 Bad Request: {error_detail}", response=response)
+
             # Raise for other HTTP errors
             response.raise_for_status()
             return response.json()
-            
+
         except requests.exceptions.RequestException as e:
             if attempt == MAX_RETRIES - 1:
+                # Log response details if available for debugging
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_body = e.response.json()
+                        print(f"❌ Final error response: {error_body}")
+                    except:
+                        print(f"❌ Final error response: {e.response.text if hasattr(e.response, 'text') else 'No response body'}")
                 raise
             print(f"⚠️  Request failed: {e}. Retrying in {retry_delay} seconds...")
             time.sleep(retry_delay)
@@ -295,27 +314,35 @@ def fetch_hubspot_data(object_type: str, properties: List[str], modified_since: 
         all_records = []
         after = 0
         page_count = 0
-        
+
         while True:
             payload['after'] = after
-            
+
             # Use rate-limited request function
             data = make_hubspot_request(url, headers, payload, method='POST')
-            
+
             results = data.get('results', [])
             all_records.extend(results)
             page_count += 1
-            
+
+            # Check if we're approaching the 10,000 limit (HubSpot Search API limitation)
+            # If we hit 10,000 records, warn and continue (reconciliation will catch any missing)
+            if len(all_records) >= 10000:
+                print(f"  ⚠️  Search API 10,000 result limit reached!")
+                print(f"  Fetched {len(all_records)} records (may be incomplete)")
+                print(f"  Reconciliation phase will catch any missing records")
+                break
+
             # Check if there are more results
             if 'paging' in data and 'next' in data['paging']:
                 after = data['paging']['next'].get('after', 0)
                 time.sleep(0.1)
             else:
                 break
-        
+
         if page_count > 1:
             print(f"  (Fetched {page_count} pages via Search API)")
-        
+
         return all_records
     
     else:
