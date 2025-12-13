@@ -37,10 +37,10 @@ jobs:
     - name: Load data into HubSpot
       env:
         HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
-        # Manual triggers use input values (default: 10000/2000 for production testing)
-        # Scheduled triggers use smaller incremental amounts (20/10)
-        NUM_CONTACTS: ${{ github.event.inputs.num_contacts || '20' }}
-        NUM_COMPANIES: ${{ github.event.inputs.num_companies || '10' }}
+        # Production-scale loading: 10,000 contacts / 2,000 companies per run
+        # Both manual and scheduled triggers use these values
+        NUM_CONTACTS: ${{ github.event.inputs.num_contacts || '10000' }}
+        NUM_COMPANIES: ${{ github.event.inputs.num_companies || '2000' }}
       run: |
         python load_data.py
 
