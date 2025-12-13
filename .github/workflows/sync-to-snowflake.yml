@@ -10,6 +10,10 @@ on:
     types:
       - completed
 
+concurrency:
+  group: hubspot-prod-pipeline-${{ github.event.workflow_run.head_branch || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   # Pre-check job: Lightweight check for changes (no Snowflake connection)
   # Only runs for manual triggers (not after workflow_run)
@@ -67,8 +71,10 @@ jobs:
     # Run if: (1) workflow_run trigger, OR (2) changes detected from pre-check
     if: |
       always() && 
-      (github.event_name == 'workflow_run' || 
-       (needs.check-for-changes.result == 'success' && needs.check-for-changes.outputs.has_changes == 'true'))
+      (
+        (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+        (github.event_name != 'workflow_run' && needs.check-for-changes.result == 'success' && needs.check-for-changes.outputs.has_changes == 'true')
+      )
 
     steps:
     - name: Checkout code

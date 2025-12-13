@@ -17,6 +17,10 @@ on:
   schedule:
     - cron: '*/30 * * * *'  # Every 30 minutes
 
+concurrency:
+  group: hubspot-prod-pipeline-${{ github.event.workflow_run.head_branch || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   load-data:
     runs-on: ubuntu-latest
