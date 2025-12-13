@@ -8,8 +8,8 @@ import sys
 import requests
 import snowflake.connector
 import time
-from datetime import datetime
-from typing import List, Dict, Optional
+from datetime import datetime, timezone
+from typing import List, Dict, Optional, Tuple
 
 # Configuration from environment variables
 HUBSPOT_API_KEY = os.environ.get('HUBSPOT_API_KEY')
@@ -192,6 +192,27 @@ def initialize_snowflake_schema(conn):
         except Exception as e:
             # Columns might already exist, ignore error
             pass
+
+        # Ensure soft delete columns exist (used throughout the sync)
+        try:
+            cursor.execute("""
+                ALTER TABLE CONTACTS
+                ADD COLUMN IF NOT EXISTS IS_DELETED BOOLEAN DEFAULT FALSE
+            """)
+            cursor.execute("""
+                ALTER TABLE CONTACTS
+                ADD COLUMN IF NOT EXISTS DELETED_AT TIMESTAMP_NTZ
+            """)
+            cursor.execute("""
+                ALTER TABLE COMPANIES
+                ADD COLUMN IF NOT EXISTS IS_DELETED BOOLEAN DEFAULT FALSE
+            """)
+            cursor.execute("""
+                ALTER TABLE COMPANIES
+                ADD COLUMN IF NOT EXISTS DELETED_AT TIMESTAMP_NTZ
+            """)
+        except Exception:
+            pass
         
         print("✓ Snowflake schema initialized successfully")
         
@@ -239,6 +260,10 @@ def should_run_reconciliation(conn, object_type: str) -> bool:
             return True
 
         run_count, last_recon, hubspot_count, snowflake_count = result
+
+        # If counts are unknown, run reconciliation to establish a baseline
+        if hubspot_count is None or snowflake_count is None:
+            return True
 
         # Always run if counts don't match
         if hubspot_count != snowflake_count:
@@ -301,56 +326,105 @@ def fetch_hubspot_data(object_type: str, properties: List[str], modified_since: 
         }
         
         # Convert modified_since to milliseconds timestamp for HubSpot
-        from datetime import datetime as dt
-        modified_dt = dt.fromisoformat(modified_since.replace('Z', '+00:00') if 'Z' in modified_since else modified_since)
-        modified_ms = int(modified_dt.timestamp() * 1000)
-        
-        payload = {
-            'filterGroups': [{
-                'filters': [{
-                    'propertyName': mod_date_property,
-                    'operator': 'GTE',  # Greater than or equal to
-                    'value': str(modified_ms)
-                }]
-            }],
-            'properties': all_properties,
-            'limit': 100
-        }
-        
-        all_records = []
-        after = None
-        page_count = 0
+        modified_dt = datetime.fromisoformat(modified_since.replace('Z', '+00:00') if 'Z' in modified_since else modified_since)
+        if modified_dt.tzinfo is None:
+            # Snowflake TIMESTAMP_NTZ values are timezone-less; we treat stored sync timestamps as UTC.
+            modified_dt = modified_dt.replace(tzinfo=timezone.utc)
+        start_ms = int(modified_dt.timestamp() * 1000)
+        end_ms = int(datetime.now(timezone.utc).timestamp() * 1000) + 1
 
-        while True:
-            if after is not None:
-                payload['after'] = str(after)
-            else:
-                payload.pop('after', None)
+        # Windowed search to avoid HubSpot Search API's 10,000 total results cap per query.
+        max_window_ms = int(os.environ.get('HUBSPOT_SEARCH_WINDOW_MS', str(6 * 60 * 60 * 1000)))
+        min_window_ms = int(os.environ.get('HUBSPOT_SEARCH_WINDOW_MIN_MS', '1000'))
 
-            # Use rate-limited request function
-            data = make_hubspot_request(url, headers, payload, method='POST')
+        def fetch_search_window(window_start_ms: int, window_end_ms: int) -> Tuple[List[Dict], bool, int]:
+            payload = {
+                'filterGroups': [{
+                    'filters': [
+                        {
+                            'propertyName': mod_date_property,
+                            'operator': 'GTE',
+                            'value': str(window_start_ms)
+                        },
+                        {
+                            'propertyName': mod_date_property,
+                            'operator': 'LT',
+                            'value': str(window_end_ms)
+                        },
+                    ]
+                }],
+                'properties': all_properties,
+                'limit': 200,
+            }
 
-            results = data.get('results', [])
-            all_records.extend(results)
-            page_count += 1
+            window_records: List[Dict] = []
+            after = None
+            page_count = 0
+            hit_limit = False
+            total_matches = 0
 
-            # Check if we're approaching the 10,000 limit (HubSpot Search API limitation)
-            # If we hit 10,000 records, warn and continue (reconciliation will catch any missing)
-            if len(all_records) >= 10000:
-                print(f"  ⚠️  Search API 10,000 result limit reached!")
-                print(f"  Fetched {len(all_records)} records (may be incomplete)")
-                print(f"  Reconciliation phase will catch any missing records")
-                break
+            while True:
+                if after is not None:
+                    payload['after'] = str(after)
+                else:
+                    payload.pop('after', None)
 
-            # Check if there are more results
-            if 'paging' in data and 'next' in data['paging']:
-                after = data['paging']['next'].get('after', 0)
-                time.sleep(0.1)
-            else:
-                break
+                data = make_hubspot_request(url, headers, payload, method='POST')
+                total_matches = int(data.get('total', 0) or 0)
 
-        if page_count > 1:
-            print(f"  (Fetched {page_count} pages via Search API)")
+                results = data.get('results', [])
+                window_records.extend(results)
+                page_count += 1
+
+                # If we exceed the Search API cap, shrink the window (if possible) rather than paging further.
+                if total_matches >= 10000:
+                    hit_limit = True
+                    if (window_end_ms - window_start_ms) > min_window_ms:
+                        break
+
+                if len(window_records) >= 10000:
+                    hit_limit = True
+                    break
+
+                if 'paging' in data and 'next' in data['paging']:
+                    after = data['paging']['next'].get('after', 0)
+                    time.sleep(0.1)
+                else:
+                    break
+
+            return window_records, hit_limit, page_count
+
+        all_records: List[Dict] = []
+        cursor_ms = start_ms
+        current_window_ms = max_window_ms
+        total_pages = 0
+        window_count = 0
+
+        print(f"  Using windowed Search API to avoid 10,000 result cap (window={max_window_ms}ms)")
+
+        while cursor_ms < end_ms:
+            window_end = min(cursor_ms + current_window_ms, end_ms)
+            window_records, hit_limit, pages = fetch_search_window(cursor_ms, window_end)
+            total_pages += pages
+
+            if hit_limit and (window_end - cursor_ms) > min_window_ms:
+                current_window_ms = max(min_window_ms, (window_end - cursor_ms) // 2)
+                continue
+
+            if hit_limit and (window_end - cursor_ms) <= min_window_ms:
+                print("  ⚠️  Search window still hit 10,000 cap at minimum window size; results may be incomplete.")
+                print("  Reconciliation will catch any missing records.")
+
+            all_records.extend(window_records)
+            window_count += 1
+            cursor_ms = window_end
+
+            # If we didn't hit the limit, try increasing window size back toward max for efficiency.
+            if not hit_limit:
+                current_window_ms = min(max_window_ms, max(current_window_ms, min_window_ms) * 2)
+
+        if total_pages > 1:
+            print(f"  (Fetched {total_pages} pages across {window_count} window(s) via Search API)")
 
         return all_records
     
@@ -526,6 +600,7 @@ def sync_contacts(conn):
 
         # Get last sync timestamp
         last_sync = get_last_sync_timestamp(conn, 'contacts')
+        is_initial_full_sync = last_sync is None
         if last_sync:
             print(f"Last sync timestamp: {last_sync}")
             print(f"  (This will fetch contacts modified on or after this time)")
@@ -619,33 +694,33 @@ def sync_contacts(conn):
         else:
             print("No new or updated contacts to sync")
 
+        current_hubspot_ids = set()
+        run_reconciliation = False
+        missing_ids = set()
+
         # PHASE 2: RECONCILIATION - Smart self-healing mechanism
         print("\n" + "-" * 70)
         print("PHASE 2: RECONCILIATION - Smart self-healing check")
         print("-" * 70)
 
-        # Check if reconciliation should run (optimization for large datasets)
-        run_reconciliation = should_run_reconciliation(conn, 'contacts')
-
-        if run_reconciliation:
-            # Get all HubSpot IDs
-            print("Running full reconciliation...")
-            print("Fetching all contact IDs from HubSpot...")
-            current_hubspot_ids = get_all_hubspot_ids('contacts')
-            print(f"  HubSpot total: {len(current_hubspot_ids)} contacts")
-
-            # Get all active Snowflake IDs
-            cursor.execute("SELECT HUBSPOT_ID FROM CONTACTS WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
-            snowflake_ids = {row[0] for row in cursor.fetchall()}
-            print(f"  Snowflake total: {len(snowflake_ids)} active contacts")
-
-            # Find missing IDs (exist in HubSpot but not in Snowflake)
-            missing_ids = current_hubspot_ids - snowflake_ids
+        if is_initial_full_sync:
+            print("Initial full sync detected - skipping reconciliation (baseline will be established from fetched records)")
+            current_hubspot_ids = {c['id'] for c in contacts}
         else:
-            # Skip detailed reconciliation, just get IDs for soft delete phase
-            print("Using fast count validation (detailed reconciliation skipped)")
-            current_hubspot_ids = set()  # Will fetch for soft delete if needed
-            missing_ids = set()
+            run_reconciliation = should_run_reconciliation(conn, 'contacts')
+            if run_reconciliation:
+                print("Running full reconciliation...")
+                print("Fetching all contact IDs from HubSpot...")
+                current_hubspot_ids = get_all_hubspot_ids('contacts')
+                print(f"  HubSpot total: {len(current_hubspot_ids)} contacts")
+
+                cursor.execute("SELECT HUBSPOT_ID FROM CONTACTS WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
+                snowflake_ids = {row[0] for row in cursor.fetchall()}
+                print(f"  Snowflake total: {len(snowflake_ids)} active contacts")
+
+                missing_ids = current_hubspot_ids - snowflake_ids
+            else:
+                print("Reconciliation skipped this cycle")
 
         if missing_ids:
             print(f"\n  Found {len(missing_ids)} missing contacts in Snowflake!")
@@ -722,53 +797,54 @@ def sync_contacts(conn):
         elif run_reconciliation:
             print("  No missing records detected - Snowflake is in sync")
 
-        # Update reconciliation metadata
-        update_reconciliation_metadata(conn, 'contacts', run_reconciliation)
+        # Update reconciliation metadata (skip on initial full sync, since metadata row may not exist yet)
+        if not is_initial_full_sync:
+            update_reconciliation_metadata(conn, 'contacts', run_reconciliation)
 
         # PHASE 3: SOFT DELETE - Handle deletions
         print("\n" + "-" * 70)
         print("PHASE 3: SOFT DELETE - Checking for deleted contacts")
         print("-" * 70)
 
-        # Fetch IDs if not already done in reconciliation phase
-        if not current_hubspot_ids:
-            print("Fetching contact IDs for soft delete check...")
-            current_hubspot_ids = get_all_hubspot_ids('contacts')
+        if is_initial_full_sync:
+            print("Initial full sync detected - skipping soft delete detection")
+        elif run_reconciliation:
+            cursor.execute("SELECT HUBSPOT_ID FROM CONTACTS WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
+            snowflake_ids = {row[0] for row in cursor.fetchall()}
+            print(f"  HubSpot IDs: {len(current_hubspot_ids)}")
+            print(f"  Active Snowflake IDs: {len(snowflake_ids)}")
 
-        cursor.execute("SELECT HUBSPOT_ID FROM CONTACTS WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
-        snowflake_ids = {row[0] for row in cursor.fetchall()}
-        print(f"  HubSpot IDs: {len(current_hubspot_ids)}")
-        print(f"  Active Snowflake IDs: {len(snowflake_ids)}")
-        
-        # Find IDs in Snowflake but not in HubSpot (deleted records)
-        deleted_ids = snowflake_ids - current_hubspot_ids
-        
-        if deleted_ids:
-            print(f"Found {len(deleted_ids)} deleted contacts, marking as deleted...")
-            # Mark as deleted in batches
-            for hubspot_id in deleted_ids:
-                cursor.execute("""
-                    UPDATE CONTACTS 
-                    SET IS_DELETED = TRUE, DELETED_AT = CURRENT_TIMESTAMP()
-                    WHERE HUBSPOT_ID = %s
-                """, (hubspot_id,))
-            print(f"✓ Marked {len(deleted_ids)} contacts as deleted")
+            deleted_ids = snowflake_ids - current_hubspot_ids
+            if deleted_ids:
+                print(f"Found {len(deleted_ids)} deleted contacts, marking as deleted...")
+                for hubspot_id in deleted_ids:
+                    cursor.execute("""
+                        UPDATE CONTACTS
+                        SET IS_DELETED = TRUE, DELETED_AT = CURRENT_TIMESTAMP()
+                        WHERE HUBSPOT_ID = %s
+                    """, (hubspot_id,))
+                print(f"✓ Marked {len(deleted_ids)} contacts as deleted")
+            else:
+                print("✓ No deletions detected")
         else:
-            print("✓ No deletions detected")
-        
-        # Validate counts by comparing with actual HubSpot total
+            print("Soft delete detection skipped this cycle (will run on reconciliation cycles)")
+
+        # Validate counts
         print("\nValidating data...")
-        print("Getting actual HubSpot total count...")
-        hubspot_total = get_hubspot_total_count('contacts')
+        perform_full_validation = is_initial_full_sync or run_reconciliation
+
+        if perform_full_validation:
+            hubspot_total = len(current_hubspot_ids) if current_hubspot_ids else 0
+            cursor.execute("SELECT COUNT(*) FROM CONTACTS WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
+            snowflake_total = cursor.fetchone()[0]
+            counts_match = (hubspot_total == snowflake_total)
+        else:
+            hubspot_total = None
+            snowflake_total = None
+            counts_match = None
         
-        # Count only active (non-deleted) records in Snowflake
-        cursor.execute("SELECT COUNT(*) FROM CONTACTS WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
-        snowflake_total = cursor.fetchone()[0]
-        
-        counts_match = (hubspot_total == snowflake_total)
-        
-        # Update sync metadata (only update timestamp if we actually synced records)
-        if latest_modified:
+        # Update sync metadata
+        if perform_full_validation and latest_modified:
             cursor.execute("""
                 MERGE INTO SYNC_METADATA AS target
                 USING (SELECT 
@@ -796,33 +872,69 @@ def sync_contacts(conn):
                     source.COUNTS_MATCH, CURRENT_TIMESTAMP()
                 )
             """, ('contacts', latest_modified, records_synced, hubspot_total, snowflake_total, counts_match))
-        else:
-            # No records synced, only update counts and match status
+        elif perform_full_validation:
             cursor.execute("""
-                UPDATE SYNC_METADATA
-                SET HUBSPOT_TOTAL_COUNT = %s,
-                    SNOWFLAKE_TOTAL_COUNT = %s,
-                    COUNTS_MATCH = %s,
+                MERGE INTO SYNC_METADATA AS target
+                USING (SELECT 
+                    %s AS OBJECT_TYPE,
+                    %s AS RECORDS_SYNCED,
+                    %s AS HUBSPOT_TOTAL_COUNT,
+                    %s AS SNOWFLAKE_TOTAL_COUNT,
+                    %s AS COUNTS_MATCH
+                ) AS source
+                ON target.OBJECT_TYPE = source.OBJECT_TYPE
+                WHEN MATCHED THEN UPDATE SET
+                    RECORDS_SYNCED = source.RECORDS_SYNCED,
+                    HUBSPOT_TOTAL_COUNT = source.HUBSPOT_TOTAL_COUNT,
+                    SNOWFLAKE_TOTAL_COUNT = source.SNOWFLAKE_TOTAL_COUNT,
+                    COUNTS_MATCH = source.COUNTS_MATCH,
                     UPDATED_AT = CURRENT_TIMESTAMP()
-                WHERE OBJECT_TYPE = %s
-            """, (hubspot_total, snowflake_total, counts_match, 'contacts'))
+                WHEN NOT MATCHED THEN INSERT (
+                    OBJECT_TYPE, RECORDS_SYNCED, HUBSPOT_TOTAL_COUNT,
+                    SNOWFLAKE_TOTAL_COUNT, COUNTS_MATCH, UPDATED_AT
+                ) VALUES (
+                    source.OBJECT_TYPE, source.RECORDS_SYNCED, source.HUBSPOT_TOTAL_COUNT,
+                    source.SNOWFLAKE_TOTAL_COUNT, source.COUNTS_MATCH, CURRENT_TIMESTAMP()
+                )
+            """, ('contacts', records_synced, hubspot_total, snowflake_total, counts_match))
+        else:
+            cursor.execute("""
+                MERGE INTO SYNC_METADATA AS target
+                USING (SELECT 
+                    %s AS OBJECT_TYPE,
+                    %s AS LAST_SYNC_TIMESTAMP,
+                    %s AS RECORDS_SYNCED
+                ) AS source
+                ON target.OBJECT_TYPE = source.OBJECT_TYPE
+                WHEN MATCHED THEN UPDATE SET
+                    LAST_SYNC_TIMESTAMP = COALESCE(source.LAST_SYNC_TIMESTAMP, target.LAST_SYNC_TIMESTAMP),
+                    RECORDS_SYNCED = source.RECORDS_SYNCED,
+                    UPDATED_AT = CURRENT_TIMESTAMP()
+                WHEN NOT MATCHED THEN INSERT (
+                    OBJECT_TYPE, LAST_SYNC_TIMESTAMP, RECORDS_SYNCED, UPDATED_AT
+                ) VALUES (
+                    source.OBJECT_TYPE, source.LAST_SYNC_TIMESTAMP, source.RECORDS_SYNCED, CURRENT_TIMESTAMP()
+                )
+            """, ('contacts', latest_modified, records_synced))
         
         conn.commit()
         
         # Print reconciliation report
         print("\n--- CONTACTS RECONCILIATION REPORT ---")
         print(f"Records synced in this batch: {records_synced}")
-        print(f"HubSpot total count: {hubspot_total}")
-        print(f"Snowflake total count: {snowflake_total}")
-        print(f"Status: {'✅ COUNTS MATCH' if counts_match else '❌ COUNT MISMATCH'}")
-        
-        # Fail if counts don't match
-        if not counts_match:
-            raise ValueError(
-                f"Data validation failed: HubSpot has {hubspot_total} contacts "
-                f"but Snowflake has {snowflake_total} contacts. "
-                f"Difference: {hubspot_total - snowflake_total} records."
-            )
+        if perform_full_validation:
+            print(f"HubSpot total count: {hubspot_total}")
+            print(f"Snowflake total count: {snowflake_total}")
+            print(f"Status: {'✅ COUNTS MATCH' if counts_match else '❌ COUNT MISMATCH'}")
+
+            if not counts_match:
+                raise ValueError(
+                    f"Data validation failed: HubSpot has {hubspot_total} contacts "
+                    f"but Snowflake has {snowflake_total} contacts. "
+                    f"Difference: {hubspot_total - snowflake_total} records."
+                )
+        else:
+            print("Count validation skipped (will be checked on reconciliation cycles)")
         
     finally:
         cursor.close()
@@ -852,6 +964,7 @@ def sync_companies(conn):
 
         # Get last sync timestamp
         last_sync = get_last_sync_timestamp(conn, 'companies')
+        is_initial_full_sync = last_sync is None
         if last_sync:
             print(f"Last sync timestamp: {last_sync}")
             print(f"  (This will fetch companies modified on or after this time)")
@@ -943,33 +1056,33 @@ def sync_companies(conn):
         else:
             print("No new or updated companies to sync")
 
+        current_hubspot_ids = set()
+        run_reconciliation = False
+        missing_ids = set()
+
         # PHASE 2: RECONCILIATION - Smart self-healing mechanism
         print("\n" + "-" * 70)
         print("PHASE 2: RECONCILIATION - Smart self-healing check")
         print("-" * 70)
 
-        # Check if reconciliation should run (optimization for large datasets)
-        run_reconciliation = should_run_reconciliation(conn, 'companies')
-
-        if run_reconciliation:
-            # Get all HubSpot IDs
-            print("Running full reconciliation...")
-            print("Fetching all company IDs from HubSpot...")
-            current_hubspot_ids = get_all_hubspot_ids('companies')
-            print(f"  HubSpot total: {len(current_hubspot_ids)} companies")
-
-            # Get all active Snowflake IDs
-            cursor.execute("SELECT HUBSPOT_ID FROM COMPANIES WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
-            snowflake_ids = {row[0] for row in cursor.fetchall()}
-            print(f"  Snowflake total: {len(snowflake_ids)} active companies")
-
-            # Find missing IDs (exist in HubSpot but not in Snowflake)
-            missing_ids = current_hubspot_ids - snowflake_ids
+        if is_initial_full_sync:
+            print("Initial full sync detected - skipping reconciliation (baseline will be established from fetched records)")
+            current_hubspot_ids = {c['id'] for c in companies}
         else:
-            # Skip detailed reconciliation, just get IDs for soft delete phase
-            print("Using fast count validation (detailed reconciliation skipped)")
-            current_hubspot_ids = set()  # Will fetch for soft delete if needed
-            missing_ids = set()
+            run_reconciliation = should_run_reconciliation(conn, 'companies')
+            if run_reconciliation:
+                print("Running full reconciliation...")
+                print("Fetching all company IDs from HubSpot...")
+                current_hubspot_ids = get_all_hubspot_ids('companies')
+                print(f"  HubSpot total: {len(current_hubspot_ids)} companies")
+
+                cursor.execute("SELECT HUBSPOT_ID FROM COMPANIES WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
+                snowflake_ids = {row[0] for row in cursor.fetchall()}
+                print(f"  Snowflake total: {len(snowflake_ids)} active companies")
+
+                missing_ids = current_hubspot_ids - snowflake_ids
+            else:
+                print("Reconciliation skipped this cycle")
 
         if missing_ids:
             print(f"\n  Found {len(missing_ids)} missing companies in Snowflake!")
@@ -1045,53 +1158,54 @@ def sync_companies(conn):
         elif run_reconciliation:
             print("  No missing records detected - Snowflake is in sync")
 
-        # Update reconciliation metadata
-        update_reconciliation_metadata(conn, 'companies', run_reconciliation)
+        # Update reconciliation metadata (skip on initial full sync, since metadata row may not exist yet)
+        if not is_initial_full_sync:
+            update_reconciliation_metadata(conn, 'companies', run_reconciliation)
 
         # PHASE 3: SOFT DELETE - Handle deletions
         print("\n" + "-" * 70)
         print("PHASE 3: SOFT DELETE - Checking for deleted companies")
         print("-" * 70)
 
-        # Fetch IDs if not already done in reconciliation phase
-        if not current_hubspot_ids:
-            print("Fetching company IDs for soft delete check...")
-            current_hubspot_ids = get_all_hubspot_ids('companies')
+        if is_initial_full_sync:
+            print("Initial full sync detected - skipping soft delete detection")
+        elif run_reconciliation:
+            cursor.execute("SELECT HUBSPOT_ID FROM COMPANIES WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
+            snowflake_ids = {row[0] for row in cursor.fetchall()}
+            print(f"  HubSpot IDs: {len(current_hubspot_ids)}")
+            print(f"  Active Snowflake IDs: {len(snowflake_ids)}")
 
-        cursor.execute("SELECT HUBSPOT_ID FROM COMPANIES WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
-        snowflake_ids = {row[0] for row in cursor.fetchall()}
-        print(f"  HubSpot IDs: {len(current_hubspot_ids)}")
-        print(f"  Active Snowflake IDs: {len(snowflake_ids)}")
-        
-        # Find IDs in Snowflake but not in HubSpot (deleted records)
-        deleted_ids = snowflake_ids - current_hubspot_ids
-        
-        if deleted_ids:
-            print(f"Found {len(deleted_ids)} deleted companies, marking as deleted...")
-            # Mark as deleted in batches
-            for hubspot_id in deleted_ids:
-                cursor.execute("""
-                    UPDATE COMPANIES 
-                    SET IS_DELETED = TRUE, DELETED_AT = CURRENT_TIMESTAMP()
-                    WHERE HUBSPOT_ID = %s
-                """, (hubspot_id,))
-            print(f"✓ Marked {len(deleted_ids)} companies as deleted")
+            deleted_ids = snowflake_ids - current_hubspot_ids
+            if deleted_ids:
+                print(f"Found {len(deleted_ids)} deleted companies, marking as deleted...")
+                for hubspot_id in deleted_ids:
+                    cursor.execute("""
+                        UPDATE COMPANIES
+                        SET IS_DELETED = TRUE, DELETED_AT = CURRENT_TIMESTAMP()
+                        WHERE HUBSPOT_ID = %s
+                    """, (hubspot_id,))
+                print(f"✓ Marked {len(deleted_ids)} companies as deleted")
+            else:
+                print("✓ No deletions detected")
         else:
-            print("✓ No deletions detected")
-        
-        # Validate counts by comparing with actual HubSpot total
+            print("Soft delete detection skipped this cycle (will run on reconciliation cycles)")
+
+        # Validate counts
         print("\nValidating data...")
-        print("Getting actual HubSpot total count...")
-        hubspot_total = get_hubspot_total_count('companies')
+        perform_full_validation = is_initial_full_sync or run_reconciliation
+
+        if perform_full_validation:
+            hubspot_total = len(current_hubspot_ids) if current_hubspot_ids else 0
+            cursor.execute("SELECT COUNT(*) FROM COMPANIES WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
+            snowflake_total = cursor.fetchone()[0]
+            counts_match = (hubspot_total == snowflake_total)
+        else:
+            hubspot_total = None
+            snowflake_total = None
+            counts_match = None
         
-        # Count only active (non-deleted) records in Snowflake
-        cursor.execute("SELECT COUNT(*) FROM COMPANIES WHERE IS_DELETED = FALSE OR IS_DELETED IS NULL")
-        snowflake_total = cursor.fetchone()[0]
-        
-        counts_match = (hubspot_total == snowflake_total)
-        
-        # Update sync metadata (only update timestamp if we actually synced records)
-        if latest_modified:
+        # Update sync metadata
+        if perform_full_validation and latest_modified:
             cursor.execute("""
                 MERGE INTO SYNC_METADATA AS target
                 USING (SELECT 
@@ -1119,33 +1233,69 @@ def sync_companies(conn):
                     source.COUNTS_MATCH, CURRENT_TIMESTAMP()
                 )
             """, ('companies', latest_modified, records_synced, hubspot_total, snowflake_total, counts_match))
-        else:
-            # No records synced, only update counts and match status
+        elif perform_full_validation:
             cursor.execute("""
-                UPDATE SYNC_METADATA
-                SET HUBSPOT_TOTAL_COUNT = %s,
-                    SNOWFLAKE_TOTAL_COUNT = %s,
-                    COUNTS_MATCH = %s,
+                MERGE INTO SYNC_METADATA AS target
+                USING (SELECT 
+                    %s AS OBJECT_TYPE,
+                    %s AS RECORDS_SYNCED,
+                    %s AS HUBSPOT_TOTAL_COUNT,
+                    %s AS SNOWFLAKE_TOTAL_COUNT,
+                    %s AS COUNTS_MATCH
+                ) AS source
+                ON target.OBJECT_TYPE = source.OBJECT_TYPE
+                WHEN MATCHED THEN UPDATE SET
+                    RECORDS_SYNCED = source.RECORDS_SYNCED,
+                    HUBSPOT_TOTAL_COUNT = source.HUBSPOT_TOTAL_COUNT,
+                    SNOWFLAKE_TOTAL_COUNT = source.SNOWFLAKE_TOTAL_COUNT,
+                    COUNTS_MATCH = source.COUNTS_MATCH,
                     UPDATED_AT = CURRENT_TIMESTAMP()
-                WHERE OBJECT_TYPE = %s
-            """, (hubspot_total, snowflake_total, counts_match, 'companies'))
+                WHEN NOT MATCHED THEN INSERT (
+                    OBJECT_TYPE, RECORDS_SYNCED, HUBSPOT_TOTAL_COUNT,
+                    SNOWFLAKE_TOTAL_COUNT, COUNTS_MATCH, UPDATED_AT
+                ) VALUES (
+                    source.OBJECT_TYPE, source.RECORDS_SYNCED, source.HUBSPOT_TOTAL_COUNT,
+                    source.SNOWFLAKE_TOTAL_COUNT, source.COUNTS_MATCH, CURRENT_TIMESTAMP()
+                )
+            """, ('companies', records_synced, hubspot_total, snowflake_total, counts_match))
+        else:
+            cursor.execute("""
+                MERGE INTO SYNC_METADATA AS target
+                USING (SELECT 
+                    %s AS OBJECT_TYPE,
+                    %s AS LAST_SYNC_TIMESTAMP,
+                    %s AS RECORDS_SYNCED
+                ) AS source
+                ON target.OBJECT_TYPE = source.OBJECT_TYPE
+                WHEN MATCHED THEN UPDATE SET
+                    LAST_SYNC_TIMESTAMP = COALESCE(source.LAST_SYNC_TIMESTAMP, target.LAST_SYNC_TIMESTAMP),
+                    RECORDS_SYNCED = source.RECORDS_SYNCED,
+                    UPDATED_AT = CURRENT_TIMESTAMP()
+                WHEN NOT MATCHED THEN INSERT (
+                    OBJECT_TYPE, LAST_SYNC_TIMESTAMP, RECORDS_SYNCED, UPDATED_AT
+                ) VALUES (
+                    source.OBJECT_TYPE, source.LAST_SYNC_TIMESTAMP, source.RECORDS_SYNCED, CURRENT_TIMESTAMP()
+                )
+            """, ('companies', latest_modified, records_synced))
         
         conn.commit()
         
         # Print reconciliation report
         print("\n--- COMPANIES RECONCILIATION REPORT ---")
         print(f"Records synced in this batch: {records_synced}")
-        print(f"HubSpot total count: {hubspot_total}")
-        print(f"Snowflake total count: {snowflake_total}")
-        print(f"Status: {'✅ COUNTS MATCH' if counts_match else '❌ COUNT MISMATCH'}")
-        
-        # Fail if counts don't match
-        if not counts_match:
-            raise ValueError(
-                f"Data validation failed: HubSpot has {hubspot_total} companies "
-                f"but Snowflake has {snowflake_total} companies. "
-                f"Difference: {hubspot_total - snowflake_total} records."
-            )
+        if perform_full_validation:
+            print(f"HubSpot total count: {hubspot_total}")
+            print(f"Snowflake total count: {snowflake_total}")
+            print(f"Status: {'✅ COUNTS MATCH' if counts_match else '❌ COUNT MISMATCH'}")
+
+            if not counts_match:
+                raise ValueError(
+                    f"Data validation failed: HubSpot has {hubspot_total} companies "
+                    f"but Snowflake has {snowflake_total} companies. "
+                    f"Difference: {hubspot_total - snowflake_total} records."
+                )
+        else:
+            print("Count validation skipped (will be checked on reconciliation cycles)")
         
     finally:
         cursor.close()
