@@ -7,11 +7,11 @@ on:
       num_contacts:
         description: 'Number of contacts to create'
         required: true
-        default: '20'
+        default: '10000'
       num_companies:
         description: 'Number of companies to create'
         required: true
-        default: '10'
+        default: '2000'
 
   # Run automatically every 5 minutes (incremental loading)
   schedule:
@@ -37,6 +37,8 @@ jobs:
     - name: Load data into HubSpot
       env:
         HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+        # Manual triggers use input values (default: 10000/2000 for production testing)
+        # Scheduled triggers use smaller incremental amounts (20/10)
         NUM_CONTACTS: ${{ github.event.inputs.num_contacts || '20' }}
         NUM_COMPANIES: ${{ github.event.inputs.num_companies || '10' }}
       run: |
