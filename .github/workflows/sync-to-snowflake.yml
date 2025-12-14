@@ -99,6 +99,7 @@ jobs:
         SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
         SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
         SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA || 'PUBLIC' }}
+        RECONCILIATION_FREQUENCY: ${{ secrets.RECONCILIATION_FREQUENCY || '10' }}
       run: |
         python -u sync_to_snowflake.py
 
