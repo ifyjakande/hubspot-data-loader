@@ -882,8 +882,51 @@ def sync_contacts(conn):
         else:
             print("Soft delete detection skipped this cycle (will run on reconciliation cycles)")
 
+        # PHASE 4: DUPLICATE CLEANUP - Remove any duplicates created during sync
+        print("\n" + "-" * 70)
+        print("PHASE 4: DUPLICATE CLEANUP - Ensuring data integrity")
+        print("-" * 70)
+
+        # Check for duplicates
+        cursor.execute("""
+            SELECT COUNT(*) as total, COUNT(DISTINCT HUBSPOT_ID) as unique_ids
+            FROM CONTACTS
+        """)
+        total_rows, unique_ids = cursor.fetchone()
+
+        if total_rows > unique_ids:
+            duplicates_count = total_rows - unique_ids
+            print(f"  Found {duplicates_count} duplicate records, cleaning up...")
+
+            # Remove duplicates keeping most recent SYNCED_AT
+            cursor.execute("""
+                CREATE TEMPORARY TABLE CONTACTS_DEDUP AS
+                SELECT HUBSPOT_ID,
+                       MAX(EMAIL) as EMAIL,
+                       MAX(FIRSTNAME) as FIRSTNAME,
+                       MAX(LASTNAME) as LASTNAME,
+                       MAX(PHONE) as PHONE,
+                       MAX(JOBTITLE) as JOBTITLE,
+                       MAX(COMPANY) as COMPANY,
+                       MAX(HS_CREATEDATE) as HS_CREATEDATE,
+                       MAX(HS_LASTMODIFIEDDATE) as HS_LASTMODIFIEDDATE,
+                       MAX(SYNCED_AT) as SYNCED_AT,
+                       MAX(IS_DELETED) as IS_DELETED,
+                       MAX(DELETED_AT) as DELETED_AT
+                FROM CONTACTS
+                GROUP BY HUBSPOT_ID
+            """)
+
+            cursor.execute("TRUNCATE TABLE CONTACTS")
+            cursor.execute("INSERT INTO CONTACTS SELECT * FROM CONTACTS_DEDUP")
+            print(f"  ✓ Removed {duplicates_count} duplicate records")
+        else:
+            print("  ✓ No duplicates found")
+
         # Validate counts
-        print("\nValidating data...")
+        print("\n" + "-" * 70)
+        print("FINAL VALIDATION")
+        print("-" * 70)
         perform_full_validation = is_initial_full_sync or run_reconciliation
 
         if perform_full_validation:
@@ -1260,8 +1303,50 @@ def sync_companies(conn):
         else:
             print("Soft delete detection skipped this cycle (will run on reconciliation cycles)")
 
+        # PHASE 4: DUPLICATE CLEANUP - Remove any duplicates created during sync
+        print("\n" + "-" * 70)
+        print("PHASE 4: DUPLICATE CLEANUP - Ensuring data integrity")
+        print("-" * 70)
+
+        # Check for duplicates
+        cursor.execute("""
+            SELECT COUNT(*) as total, COUNT(DISTINCT HUBSPOT_ID) as unique_ids
+            FROM COMPANIES
+        """)
+        total_rows, unique_ids = cursor.fetchone()
+
+        if total_rows > unique_ids:
+            duplicates_count = total_rows - unique_ids
+            print(f"  Found {duplicates_count} duplicate records, cleaning up...")
+
+            # Remove duplicates keeping most recent SYNCED_AT
+            cursor.execute("""
+                CREATE TEMPORARY TABLE COMPANIES_DEDUP AS
+                SELECT HUBSPOT_ID,
+                       MAX(NAME) as NAME,
+                       MAX(DOMAIN) as DOMAIN,
+                       MAX(INDUSTRY) as INDUSTRY,
+                       MAX(CITY) as CITY,
+                       MAX(COUNTRY) as COUNTRY,
+                       MAX(HS_CREATEDATE) as HS_CREATEDATE,
+                       MAX(HS_LASTMODIFIEDDATE) as HS_LASTMODIFIEDDATE,
+                       MAX(SYNCED_AT) as SYNCED_AT,
+                       MAX(IS_DELETED) as IS_DELETED,
+                       MAX(DELETED_AT) as DELETED_AT
+                FROM COMPANIES
+                GROUP BY HUBSPOT_ID
+            """)
+
+            cursor.execute("TRUNCATE TABLE COMPANIES")
+            cursor.execute("INSERT INTO COMPANIES SELECT * FROM COMPANIES_DEDUP")
+            print(f"  ✓ Removed {duplicates_count} duplicate records")
+        else:
+            print("  ✓ No duplicates found")
+
         # Validate counts
-        print("\nValidating data...")
+        print("\n" + "-" * 70)
+        print("FINAL VALIDATION")
+        print("-" * 70)
         perform_full_validation = is_initial_full_sync or run_reconciliation
 
         if perform_full_validation:
