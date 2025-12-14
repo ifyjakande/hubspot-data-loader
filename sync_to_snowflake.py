@@ -658,13 +658,35 @@ def sync_contacts(conn):
         
         records_synced = len(contacts)
         latest_modified_dt: Optional[datetime] = None
-        
+
         # Only perform insert/merge if there are contacts to sync
         if contacts:
+            # Deduplicate contacts from HubSpot (API can return duplicates)
+            # Keep the most recent version based on lastmodifieddate
+            print("Deduplicating fetched contacts...")
+            contacts_dict = {}
+            for contact in contacts:
+                hubspot_id = contact['id']
+                mod_date = contact['properties'].get('lastmodifieddate')
+
+                # Keep this contact if it's new or has a more recent modification date
+                if hubspot_id not in contacts_dict:
+                    contacts_dict[hubspot_id] = contact
+                elif mod_date and contacts_dict[hubspot_id]['properties'].get('lastmodifieddate'):
+                    if mod_date > contacts_dict[hubspot_id]['properties'].get('lastmodifieddate'):
+                        contacts_dict[hubspot_id] = contact
+
+            unique_contacts = list(contacts_dict.values())
+            duplicates_removed = len(contacts) - len(unique_contacts)
+            if duplicates_removed > 0:
+                print(f"  ✓ Removed {duplicates_removed} duplicate IDs from HubSpot response")
+            contacts = unique_contacts
+            records_synced = len(contacts)
+
             # Batch insert/update using temp table for better performance
             print("Creating temporary staging table...")
             cursor.execute("CREATE TEMPORARY TABLE CONTACTS_STAGE LIKE CONTACTS")
-            
+
             # Insert all records into staging table
             print("Inserting records into staging table...")
             insert_sql = """
@@ -1082,13 +1104,35 @@ def sync_companies(conn):
         
         records_synced = len(companies)
         latest_modified_dt: Optional[datetime] = None
-        
+
         # Only perform insert/merge if there are companies to sync
         if companies:
+            # Deduplicate companies from HubSpot (API can return duplicates)
+            # Keep the most recent version based on hs_lastmodifieddate
+            print("Deduplicating fetched companies...")
+            companies_dict = {}
+            for company in companies:
+                hubspot_id = company['id']
+                mod_date = company['properties'].get('hs_lastmodifieddate')
+
+                # Keep this company if it's new or has a more recent modification date
+                if hubspot_id not in companies_dict:
+                    companies_dict[hubspot_id] = company
+                elif mod_date and companies_dict[hubspot_id]['properties'].get('hs_lastmodifieddate'):
+                    if mod_date > companies_dict[hubspot_id]['properties'].get('hs_lastmodifieddate'):
+                        companies_dict[hubspot_id] = company
+
+            unique_companies = list(companies_dict.values())
+            duplicates_removed = len(companies) - len(unique_companies)
+            if duplicates_removed > 0:
+                print(f"  ✓ Removed {duplicates_removed} duplicate IDs from HubSpot response")
+            companies = unique_companies
+            records_synced = len(companies)
+
             # Batch insert/update using temp table for better performance
             print("Creating temporary staging table...")
             cursor.execute("CREATE TEMPORARY TABLE COMPANIES_STAGE LIKE COMPANIES")
-            
+
             # Insert all records into staging table
             print("Inserting records into staging table...")
             insert_sql = """
