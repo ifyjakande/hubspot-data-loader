@@ -21,7 +21,6 @@ In `sync_to_snowflake.py`, records are inserted into staging tables using `curso
 Even if only a small number of records changed, the sync currently does heavy full-scan operations:
 
 - **Soft delete detection**: `get_all_hubspot_ids()` pages through *all* objects to build an ID set.
-- **Validation counts**: `get_hubspot_total_count()` paginates through *all* objects every run.
 
 At ~200k records, this can mean thousands of HubSpot API calls per run, increasing:
 

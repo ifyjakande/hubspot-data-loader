@@ -55,13 +55,13 @@ jobs:
     - name: Changes Summary
       run: |
         if [ "${{ steps.check.outputs.has_changes }}" == "true" ]; then
-          echo "✅ Changes detected:"
+          echo "[SUCCESS] Changes detected:"
           echo "   - Contacts: ${{ steps.check.outputs.contacts_changed }}"
           echo "   - Companies: ${{ steps.check.outputs.companies_changed }}"
           echo "   → Proceeding with sync"
         else
-          echo "⏭️  No changes detected - Sync will be skipped"
-          echo "   💰 Snowflake compute cost saved!"
+          echo "[SKIP] No changes detected - Sync will be skipped"
+          echo "   Snowflake compute cost saved!"
         fi
 
   # Sync job: Only runs if changes detected OR triggered by workflow_run
@@ -106,12 +106,12 @@ jobs:
     - name: Sync Summary
       if: success()
       run: |
-        echo "✅ Sync completed successfully!"
+        echo "[SUCCESS] Sync completed successfully!"
         echo "Data has been synchronized from HubSpot to Snowflake."
         echo "Check the logs above for reconciliation report."
 
     - name: Sync Failed
       if: failure()
       run: |
-        echo "❌ Sync failed! Check the logs above for details."
+        echo "[ERROR] Sync failed! Check the logs above for details."
         exit 1

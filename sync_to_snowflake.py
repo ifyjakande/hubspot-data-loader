@@ -68,13 +68,13 @@ def make_hubspot_request(
             # Handle rate limiting (429) and server errors (5xx)
             if response.status_code == 429:
                 retry_after = int(response.headers.get('Retry-After', retry_delay))
-                print(f"⚠️  Rate limited. Waiting {retry_after} seconds before retry...")
+                print(f"[WARNING] Rate limited. Waiting {retry_after} seconds before retry...")
                 time.sleep(retry_after)
                 retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
                 continue
             
             if response.status_code >= 500:
-                print(f"⚠️  Server error {response.status_code}. Retrying in {retry_delay} seconds...")
+                print(f"[WARNING] Server error {response.status_code}. Retrying in {retry_delay} seconds...")
                 time.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
                 continue
@@ -84,9 +84,9 @@ def make_hubspot_request(
                 error_detail = "No error details"
                 try:
                     error_detail = response.json()
-                except:
+                except Exception:
                     error_detail = response.text
-                print(f"❌ Bad Request (400) - HubSpot API Error:")
+                print(f"[ERROR] Bad Request (400) - HubSpot API Error:")
                 print(f"   URL: {url}")
                 print(f"   Error details: {error_detail}")
                 raise requests.exceptions.HTTPError(f"400 Bad Request: {error_detail}", response=response)
@@ -101,11 +101,11 @@ def make_hubspot_request(
                 if hasattr(e, 'response') and e.response is not None:
                     try:
                         error_body = e.response.json()
-                        print(f"❌ Final error response: {error_body}")
-                    except:
-                        print(f"❌ Final error response: {e.response.text if hasattr(e.response, 'text') else 'No response body'}")
+                        print(f"[ERROR] Final error response: {error_body}")
+                    except Exception:
+                        print(f"[ERROR] Final error response: {e.response.text if hasattr(e.response, 'text') else 'No response body'}")
                 raise
-            print(f"⚠️  Request failed: {e}. Retrying in {retry_delay} seconds...")
+            print(f"[WARNING] Request failed: {e}. Retrying in {retry_delay} seconds...")
             time.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
     
@@ -214,7 +214,7 @@ def initialize_snowflake_schema(conn):
         except Exception:
             pass
         
-        print("✓ Snowflake schema initialized successfully")
+        print("[OK] Snowflake schema initialized successfully")
         
     finally:
         cursor.close()
@@ -449,7 +449,7 @@ def fetch_hubspot_data(object_type: str, properties: List[str], modified_since: 
                 continue
 
             if hit_limit and (window_end - cursor_ms) <= min_window_ms:
-                print("  ⚠️  Search window still hit 10,000 cap at minimum window size; results may be incomplete.")
+                print("  [WARNING] Search window still hit 10,000 cap at minimum window size; results may be incomplete.")
                 print("  Reconciliation will catch any missing records.")
 
             all_records.extend(window_records)
@@ -505,37 +505,6 @@ def fetch_hubspot_data(object_type: str, properties: List[str], modified_since: 
             print(f"  (Fetched {page_count} pages)")
         
         return all_records
-
-def get_hubspot_total_count(object_type: str) -> int:
-    """Get total count of records in HubSpot by paginating through all results with rate limiting"""
-    url = f'{HUBSPOT_API_URL}/crm/v3/objects/{object_type}'
-    headers = {
-        'Authorization': f'Bearer {HUBSPOT_API_KEY}',
-        'Content-Type': 'application/json'
-    }
-    
-    params = {'limit': 100}
-    total_count = 0
-    after = None
-    
-    while True:
-        if after:
-            params['after'] = after
-        
-        # Use rate-limited request function
-        data = make_hubspot_request(url, headers, params, method='GET')
-        
-        results = data.get('results', [])
-        total_count += len(results)
-        
-        paging = data.get('paging', {})
-        if 'next' in paging:
-            after = paging['next'].get('after')
-            time.sleep(0.1)  # Small delay between pages
-        else:
-            break
-    
-    return total_count
 
 def get_all_hubspot_ids(object_type: str) -> set:
     """Get all current HubSpot IDs for an object type (for soft delete detection)"""
@@ -606,7 +575,7 @@ def fetch_records_by_ids(object_type: str, record_ids: List[str], properties: Li
             all_records.extend(results)
             time.sleep(0.1)  # Rate limiting
         except Exception as e:
-            print(f"  ⚠️  Warning: Failed to fetch batch starting at index {i}: {e}")
+            print(f"  [WARNING] Warning: Failed to fetch batch starting at index {i}: {e}")
             # Continue with other batches
             continue
 
@@ -648,7 +617,7 @@ def sync_contacts(conn):
         print("Fetching contacts from HubSpot...")
         properties = ['email', 'firstname', 'lastname', 'phone', 'jobtitle', 'company', 'createdate']
         contacts = fetch_hubspot_data('contacts', properties, last_sync)
-        print(f"✓ Fetched {len(contacts)} contacts to sync")
+        print(f"[OK] Fetched {len(contacts)} contacts to sync")
         
         if len(contacts) > 0 and last_sync:
             # Show sample of what's being synced (contacts use 'lastmodifieddate')
@@ -679,7 +648,7 @@ def sync_contacts(conn):
             unique_contacts = list(contacts_dict.values())
             duplicates_removed = len(contacts) - len(unique_contacts)
             if duplicates_removed > 0:
-                print(f"  ✓ Removed {duplicates_removed} duplicate IDs from HubSpot response")
+                print(f"  [OK] Removed {duplicates_removed} duplicate IDs from HubSpot response")
             contacts = unique_contacts
             records_synced = len(contacts)
 
@@ -745,7 +714,7 @@ def sync_contacts(conn):
                 )
             """)
             
-            print(f"✓ Merged {records_synced} records")
+            print(f"[OK] Merged {records_synced} records")
             
             # Get latest modified timestamp (UTC) - contacts use 'lastmodifieddate'
             for c in contacts:
@@ -898,9 +867,9 @@ def sync_contacts(conn):
                     FROM DELETED_CONTACTS_STAGE AS s
                     WHERE t.HUBSPOT_ID = s.HUBSPOT_ID
                 """)
-                print(f"✓ Marked {len(deleted_ids)} contacts as deleted")
+                print(f"[OK] Marked {len(deleted_ids)} contacts as deleted")
             else:
-                print("✓ No deletions detected")
+                print("[OK] No deletions detected")
         else:
             print("Soft delete detection skipped this cycle (will run on reconciliation cycles)")
 
@@ -941,9 +910,9 @@ def sync_contacts(conn):
 
             cursor.execute("TRUNCATE TABLE CONTACTS")
             cursor.execute("INSERT INTO CONTACTS SELECT * FROM CONTACTS_DEDUP")
-            print(f"  ✓ Removed {duplicates_count} duplicate records")
+            print(f"  [OK] Removed {duplicates_count} duplicate records")
         else:
-            print("  ✓ No duplicates found")
+            print("  [OK] No duplicates found")
 
         # Validate counts
         print("\n" + "-" * 70)
@@ -1044,7 +1013,7 @@ def sync_contacts(conn):
         if perform_full_validation:
             print(f"HubSpot total count: {hubspot_total}")
             print(f"Snowflake total count: {snowflake_total}")
-            print(f"Status: {'✅ COUNTS MATCH' if counts_match else '❌ COUNT MISMATCH'}")
+            print(f"Status: {'[SUCCESS] COUNTS MATCH' if counts_match else '[ERROR] COUNT MISMATCH'}")
 
             if not counts_match:
                 raise ValueError(
@@ -1094,7 +1063,7 @@ def sync_companies(conn):
         print("Fetching companies from HubSpot...")
         properties = ['name', 'domain', 'industry', 'city', 'country', 'createdate']
         companies = fetch_hubspot_data('companies', properties, last_sync)
-        print(f"✓ Fetched {len(companies)} companies to sync")
+        print(f"[OK] Fetched {len(companies)} companies to sync")
         
         if len(companies) > 0 and last_sync:
             # Show sample of what's being synced
@@ -1125,7 +1094,7 @@ def sync_companies(conn):
             unique_companies = list(companies_dict.values())
             duplicates_removed = len(companies) - len(unique_companies)
             if duplicates_removed > 0:
-                print(f"  ✓ Removed {duplicates_removed} duplicate IDs from HubSpot response")
+                print(f"  [OK] Removed {duplicates_removed} duplicate IDs from HubSpot response")
             companies = unique_companies
             records_synced = len(companies)
 
@@ -1189,7 +1158,7 @@ def sync_companies(conn):
                 )
             """)
             
-            print(f"✓ Merged {records_synced} records")
+            print(f"[OK] Merged {records_synced} records")
             
             # Get latest modified timestamp (UTC)
             for c in companies:
@@ -1341,9 +1310,9 @@ def sync_companies(conn):
                     FROM DELETED_COMPANIES_STAGE AS s
                     WHERE t.HUBSPOT_ID = s.HUBSPOT_ID
                 """)
-                print(f"✓ Marked {len(deleted_ids)} companies as deleted")
+                print(f"[OK] Marked {len(deleted_ids)} companies as deleted")
             else:
-                print("✓ No deletions detected")
+                print("[OK] No deletions detected")
         else:
             print("Soft delete detection skipped this cycle (will run on reconciliation cycles)")
 
@@ -1383,9 +1352,9 @@ def sync_companies(conn):
 
             cursor.execute("TRUNCATE TABLE COMPANIES")
             cursor.execute("INSERT INTO COMPANIES SELECT * FROM COMPANIES_DEDUP")
-            print(f"  ✓ Removed {duplicates_count} duplicate records")
+            print(f"  [OK] Removed {duplicates_count} duplicate records")
         else:
-            print("  ✓ No duplicates found")
+            print("  [OK] No duplicates found")
 
         # Validate counts
         print("\n" + "-" * 70)
@@ -1486,7 +1455,7 @@ def sync_companies(conn):
         if perform_full_validation:
             print(f"HubSpot total count: {hubspot_total}")
             print(f"Snowflake total count: {snowflake_total}")
-            print(f"Status: {'✅ COUNTS MATCH' if counts_match else '❌ COUNT MISMATCH'}")
+            print(f"Status: {'[SUCCESS] COUNTS MATCH' if counts_match else '[ERROR] COUNT MISMATCH'}")
 
             if not counts_match:
                 raise ValueError(
@@ -1512,7 +1481,7 @@ def main():
         # Connect to Snowflake
         print("\nConnecting to Snowflake...")
         conn = get_snowflake_connection()
-        print("✓ Connected successfully")
+        print("[OK] Connected successfully")
         
         # Initialize schema
         initialize_snowflake_schema(conn)
@@ -1522,14 +1491,14 @@ def main():
         sync_companies(conn)
         
         print("\n" + "=" * 70)
-        print("✅ SYNC COMPLETED SUCCESSFULLY")
+        print("[SUCCESS] SYNC COMPLETED SUCCESSFULLY")
         print("=" * 70)
         print(f"Completed at: {datetime.now()}")
         
         conn.close()
         
     except Exception as e:
-        print(f"\n❌ ERROR: {e}")
+        print(f"\n[ERROR] ERROR: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)

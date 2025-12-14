@@ -7,7 +7,7 @@ import os
 import random
 import requests
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from faker import Faker
 
 # Initialize Faker for generating realistic data
@@ -70,7 +70,7 @@ def batch_create_companies(companies_data):
                 # Handle rate limiting
                 if response.status_code == 429:
                     retry_after = int(response.headers.get('Retry-After', retry_delay))
-                    print(f"  ⚠️  Rate limited. Waiting {retry_after} seconds...")
+                    print(f"  [WARNING] Rate limited. Waiting {retry_after} seconds...")
                     time.sleep(retry_after)
                     retry_delay *= 2
                     continue
@@ -81,7 +81,7 @@ def batch_create_companies(companies_data):
                 # Track successful creations
                 if 'results' in result:
                     all_created.extend(result['results'])
-                    print(f"  ✓ Created batch {i//batch_size + 1}: {len(result['results'])} companies")
+                    print(f"  [OK] Created batch {i//batch_size + 1}: {len(result['results'])} companies")
 
                 # Small delay between batches to avoid rate limiting
                 time.sleep(0.5)
@@ -90,11 +90,11 @@ def batch_create_companies(companies_data):
             except (requests.exceptions.HTTPError, requests.exceptions.SSLError,
                     requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                 if attempt == MAX_RETRIES - 1:
-                    print(f"  ✗ Error creating company batch after {MAX_RETRIES} attempts: {e}")
+                    print(f"  [ERROR] Error creating company batch after {MAX_RETRIES} attempts: {e}")
                     if hasattr(e, 'response') and hasattr(e.response, 'text'):
                         print(f"  Response: {e.response.text}")
                 else:
-                    print(f"  ⚠️  Network error (attempt {attempt + 1}/{MAX_RETRIES}): {type(e).__name__}. Retrying in {retry_delay}s...")
+                    print(f"  [WARNING] Network error (attempt {attempt + 1}/{MAX_RETRIES}): {type(e).__name__}. Retrying in {retry_delay}s...")
                     time.sleep(retry_delay)
                     retry_delay *= 2
 
@@ -146,7 +146,7 @@ def batch_create_contacts(contacts_data):
                 # Handle rate limiting
                 if response.status_code == 429:
                     retry_after = int(response.headers.get('Retry-After', retry_delay))
-                    print(f"  ⚠️  Rate limited. Waiting {retry_after} seconds...")
+                    print(f"  [WARNING] Rate limited. Waiting {retry_after} seconds...")
                     time.sleep(retry_after)
                     retry_delay *= 2
                     continue
@@ -157,7 +157,7 @@ def batch_create_contacts(contacts_data):
                 # Track successful creations
                 if 'results' in result:
                     all_created.extend(result['results'])
-                    print(f"  ✓ Created batch {i//batch_size + 1}: {len(result['results'])} contacts")
+                    print(f"  [OK] Created batch {i//batch_size + 1}: {len(result['results'])} contacts")
 
                 # Small delay between batches to avoid rate limiting
                 time.sleep(0.5)
@@ -166,11 +166,11 @@ def batch_create_contacts(contacts_data):
             except (requests.exceptions.HTTPError, requests.exceptions.SSLError,
                     requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                 if attempt == MAX_RETRIES - 1:
-                    print(f"  ✗ Error creating contact batch after {MAX_RETRIES} attempts: {e}")
+                    print(f"  [ERROR] Error creating contact batch after {MAX_RETRIES} attempts: {e}")
                     if hasattr(e, 'response') and hasattr(e.response, 'text'):
                         print(f"  Response: {e.response.text}")
                 else:
-                    print(f"  ⚠️  Network error (attempt {attempt + 1}/{MAX_RETRIES}): {type(e).__name__}. Retrying in {retry_delay}s...")
+                    print(f"  [WARNING] Network error (attempt {attempt + 1}/{MAX_RETRIES}): {type(e).__name__}. Retrying in {retry_delay}s...")
                     time.sleep(retry_delay)
                     retry_delay *= 2
 
@@ -222,7 +222,7 @@ def generate_sample_data(num_contacts=10, num_companies=5):
             'country': country
         })
 
-    print(f"  ✓ Generated {len(companies_data)} companies")
+    print(f"  [OK] Generated {len(companies_data)} companies")
 
     # PHASE 2: Batch create companies
     print("\n[PHASE 2] Creating companies in HubSpot (batch mode)...")
@@ -236,7 +236,7 @@ def generate_sample_data(num_contacts=10, num_companies=5):
             'domain': company_data['domain']
         })
 
-    print(f"  ✓ Successfully created {len(companies_created)}/{num_companies} companies")
+    print(f"  [OK] Successfully created {len(companies_created)}/{num_companies} companies")
 
     # PHASE 3: Generate contact data with referential integrity
     print("\n[PHASE 3] Generating contact data (maintaining referential integrity)...")
@@ -267,12 +267,12 @@ def generate_sample_data(num_contacts=10, num_companies=5):
             'company': company_name
         })
 
-    print(f"  ✓ Generated {len(contacts_data)} contacts")
+    print(f"  [OK] Generated {len(contacts_data)} contacts")
 
     # PHASE 4: Batch create contacts
     print("\n[PHASE 4] Creating contacts in HubSpot (batch mode)...")
     contacts_created = batch_create_contacts(contacts_data)
-    print(f"  ✓ Successfully created {len(contacts_created)}/{num_contacts} contacts")
+    print(f"  [OK] Successfully created {len(contacts_created)}/{num_contacts} contacts")
 
     # Summary
     print("\n" + "=" * 70)

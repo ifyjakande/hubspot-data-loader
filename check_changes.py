@@ -37,12 +37,10 @@ def get_last_sync_timestamps() -> Dict[str, Optional[str]]:
         )
         
         cursor = conn.cursor()
-        # Also retrieve Snowflake counts for active (non-deleted) records
         cursor.execute("""
-            SELECT 
-                OBJECT_TYPE, 
-                LAST_SYNC_TIMESTAMP,
-                SNOWFLAKE_TOTAL_COUNT
+            SELECT
+                OBJECT_TYPE,
+                LAST_SYNC_TIMESTAMP
             FROM SYNC_METADATA
         """)
         
@@ -57,7 +55,7 @@ def get_last_sync_timestamps() -> Dict[str, Optional[str]]:
         
         return timestamps
     except Exception as e:
-        print(f"⚠️  Could not retrieve sync timestamps: {e}")
+        print(f"[WARNING] Could not retrieve sync timestamps: {e}")
         # Default to None to force a sync if we can't check
         return {'contacts': None, 'companies': None}
 
@@ -77,7 +75,7 @@ def count_changes_in_hubspot(object_type: str, modified_since: Optional[str]) ->
         modified_dt = datetime.fromisoformat(modified_since.replace('Z', '+00:00') if 'Z' in modified_since else modified_since)
         modified_ms = int(modified_dt.timestamp() * 1000)
     except Exception as e:
-        print(f"  ⚠️  Error parsing timestamp for {object_type}: {e}")
+        print(f"  [WARNING] Error parsing timestamp for {object_type}: {e}")
         return 1  # Assume changes to be safe
     
     # Use HubSpot Search API to count modified records
@@ -109,7 +107,7 @@ def count_changes_in_hubspot(object_type: str, modified_since: Optional[str]) ->
         return total
         
     except requests.exceptions.RequestException as e:
-        print(f"  ⚠️  Error checking {object_type}: {e}")
+        print(f"  [WARNING] Error checking {object_type}: {e}")
         return 1  # Assume changes exist to be safe
 
 def main():
@@ -120,7 +118,7 @@ def main():
     print(f"Time: {datetime.now()}\n")
     
     if not HUBSPOT_API_KEY:
-        print("❌ ERROR: HUBSPOT_API_KEY not set")
+        print("[ERROR] ERROR: HUBSPOT_API_KEY not set")
         sys.exit(1)
     
     # Get last sync timestamps
@@ -151,10 +149,10 @@ def main():
     
     print("\n" + "=" * 70)
     if has_changes:
-        print("✅ CHANGES DETECTED - Sync needed")
+        print("[SUCCESS] CHANGES DETECTED - Sync needed")
         print(f"   {contacts_changed} contacts + {companies_changed} companies modified")
     else:
-        print("⏭️  NO CHANGES - Sync can be skipped")
+        print("[SKIP] NO CHANGES - Sync can be skipped")
         print("   Snowflake compute cost saved!")
     print("=" * 70)
     
